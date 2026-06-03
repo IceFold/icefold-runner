@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# runner scratch (staged inputs + ffmpeg products)
+icefold-runner-data/
+*-runner-data/
+.env
