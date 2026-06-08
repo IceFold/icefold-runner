@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import random
+import time
 from typing import Dict, Optional
 from urllib.parse import urlencode, urlsplit, urlunsplit
 
@@ -39,6 +40,10 @@ _BACKOFF_MIN = 1.0
 _BACKOFF_MAX = 30.0
 _KEEPALIVE_S = 20.0
 _MAX_FRAME = 8 * 1024 * 1024
+# A connection that stayed up at least this long counts as "healthy": its drop
+# is a fresh incident, not part of a tight reconnect storm, so we reset the
+# backoff and reconnect fast instead of waiting out the escalated ceiling.
+_HEALTHY_UPTIME_S = 5.0
 
 
 class AuthError(Exception):
@@ -71,6 +76,9 @@ class WorkerClient:
         # we await the server's matching ``node_callback_result`` to resolve
         # the bundle's future.
         self._pending_callbacks: Dict[str, "asyncio.Future[dict]"] = {}
+        # Monotonic timestamp of the most recent successful connect, or None
+        # while disconnected. Drives the healthy-drop backoff reset.
+        self._connected_at: Optional[float] = None
 
     # ── URL helpers ──
 
@@ -101,6 +109,7 @@ class WorkerClient:
              server=self.server, worker_id=self.worker_id)
         backoff = _BACKOFF_MIN
         while True:
+            self._connected_at = None
             try:
                 await self._run_once()
                 backoff = _BACKOFF_MIN
@@ -109,10 +118,23 @@ class WorkerClient:
                 _log("error", f"authentication failed; exiting: {e}")
                 return
             except Exception as e:  # noqa: BLE001
+                # A connection that was actually established and stayed up is a
+                # healthy session that happened to drop — not the server being
+                # down. Reset the backoff so we reconnect promptly instead of
+                # serving out a ceiling we only escalated to during real outages.
+                if self._was_healthy():
+                    backoff = _BACKOFF_MIN
                 _log("error", f"connection failed: {e}", next_retry=round(backoff, 1))
             sleep = backoff + random.uniform(0, backoff / 4)
             await asyncio.sleep(sleep)
             backoff = min(backoff * 2, _BACKOFF_MAX)
+
+    def _was_healthy(self) -> bool:
+        """True if the last dial reached a connection that stayed up a while."""
+        return (
+            self._connected_at is not None
+            and (time.monotonic() - self._connected_at) >= _HEALTHY_UPTIME_S
+        )
 
     async def _run_once(self) -> None:
         url = self._ws_url()
@@ -133,6 +155,7 @@ class WorkerClient:
                 "version": VERSION,
                 "capabilities": ["builtin"],
             })
+            self._connected_at = time.monotonic()
             _log("info", "connected", worker_id=self.worker_id)
             keepalive = asyncio.create_task(self._keepalive(ws))
             try:
