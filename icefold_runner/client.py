@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import random
 import time
 from typing import Dict, Optional
@@ -38,7 +39,23 @@ from icefold import log_error, log_info, log_warning
 
 _BACKOFF_MIN = 1.0
 _BACKOFF_MAX = 30.0
-_KEEPALIVE_S = 20.0
+
+
+def _keepalive_s() -> float:
+    """Ping cadence (and ping timeout) for the worker link, in seconds.
+
+    Must stay comfortably under any proxy/CDN WebSocket idle timeout in front of
+    the server (Cloudflare's is ~100 s) so the connection never goes idle and
+    half-opens. Tunable via ``ICEFOLD_RUNNER_KEEPALIVE_S`` for aggressive
+    front-ends; clamped to [5, 90] s. Defaults to 20 s."""
+    raw = os.environ.get("ICEFOLD_RUNNER_KEEPALIVE_S", "")
+    try:
+        return min(90.0, max(5.0, float(raw))) if raw else 20.0
+    except ValueError:
+        return 20.0
+
+
+_KEEPALIVE_S = _keepalive_s()
 _MAX_FRAME = 8 * 1024 * 1024
 # A connection that stayed up at least this long counts as "healthy": its drop
 # is a fresh incident, not part of a tight reconnect storm, so we reset the
