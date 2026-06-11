@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import platform
 import random
 import time
 from typing import Dict, Optional
@@ -170,6 +171,8 @@ class WorkerClient:
                 "type": WKR_HELLO,
                 "worker_id": self.worker_id,
                 "version": VERSION,
+                # Shown in Settings → Runners ("Linux" / "Darwin" / "Windows").
+                "os": platform.system(),
                 "capabilities": ["builtin"],
             })
             self._connected_at = time.monotonic()
