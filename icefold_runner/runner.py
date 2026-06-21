@@ -95,13 +95,21 @@ class NodeRunner:
             )
         timeout = max(1.0, msg.get("timeout_ms", 1800_000) / 1000.0)
 
-        async with httpx.AsyncClient(timeout=httpx.Timeout(600.0)) as http:
-            local_inputs = await self._download_inputs(http, msg.get("inputs") or {})
-            output = await asyncio.wait_for(
-                self._run_bundle(http, bundle_hash, msg, local_inputs, send_callback),
-                timeout=timeout,
-            )
-            return await self._upload_outputs(http, output, msg.get("session_id", ""))
+        # Per-call staging dir for downloaded inputs, removed in finally: nothing
+        # else ever cleaned _STAGED_DIR, so a long-lived runner pulling media
+        # inputs would accumulate them until the disk filled (ENOSPC).
+        stage_dir = os.path.join(_STAGED_DIR, os.urandom(8).hex())
+        os.makedirs(stage_dir, exist_ok=True)
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(600.0)) as http:
+                local_inputs = await self._download_inputs(http, msg.get("inputs") or {}, stage_dir)
+                output = await asyncio.wait_for(
+                    self._run_bundle(http, bundle_hash, msg, local_inputs, send_callback),
+                    timeout=timeout,
+                )
+                return await self._upload_outputs(http, output, msg.get("session_id", ""))
+        finally:
+            shutil.rmtree(stage_dir, ignore_errors=True)
 
     # ── bundle path ──
 
@@ -227,20 +235,20 @@ class NodeRunner:
 
     # ── input staging (download) ──
 
-    async def _download_inputs(self, http: httpx.AsyncClient, inputs: Any) -> Any:
+    async def _download_inputs(self, http: httpx.AsyncClient, inputs: Any, stage_dir: str) -> Any:
         if isinstance(inputs, str):
             if _is_server_ref(inputs):
-                return await self._download_one(http, inputs)
+                return await self._download_one(http, inputs, stage_dir)
             return inputs
         if isinstance(inputs, dict):
-            return {k: await self._download_inputs(http, v) for k, v in inputs.items()}
+            return {k: await self._download_inputs(http, v, stage_dir) for k, v in inputs.items()}
         if isinstance(inputs, (list, tuple)):
-            return [await self._download_inputs(http, v) for v in inputs]
+            return [await self._download_inputs(http, v, stage_dir) for v in inputs]
         return inputs
 
-    async def _download_one(self, http: httpx.AsyncClient, ref: str) -> str:
+    async def _download_one(self, http: httpx.AsyncClient, ref: str, stage_dir: str) -> str:
         url = self._http_base + ref
-        dest = os.path.join(_STAGED_DIR, f"{os.urandom(8).hex()}{_ext_from_ref(ref)}")
+        dest = os.path.join(stage_dir, f"{os.urandom(8).hex()}{_ext_from_ref(ref)}")
         self._log("info", f"pulling input {ref}")
         async with http.stream("GET", url) as resp:
             resp.raise_for_status()
@@ -280,3 +288,54 @@ class NodeRunner:
         if not server_path:
             raise RuntimeError("server did not return a stored path for output")
         return server_path
+
+
+if __name__ == "__main__":
+    import asyncio as _asyncio
+    import tempfile
+
+    async def _smoke() -> None:
+        # run() must remove its per-call staging dir on every path — staged
+        # input files were never cleaned, so a long-lived runner leaked disk.
+        globals()["_STAGED_DIR"] = tempfile.mkdtemp()
+        runner = NodeRunner("http://x", "tok", lambda *a, **k: None)
+        captured: dict = {}
+
+        async def _fake_download(http, inputs, stage_dir):
+            captured["stage_dir"] = stage_dir
+            assert os.path.isdir(stage_dir)
+            with open(os.path.join(stage_dir, "in.bin"), "wb") as fh:
+                fh.write(b"x")
+            return inputs
+
+        async def _fake_run_bundle(http, bundle_hash, msg, local_inputs, send_callback):
+            assert os.path.isdir(captured["stage_dir"]), "stage dir must live during run"
+            return "out"
+
+        async def _fake_upload(http, output, session_id):
+            return output
+
+        runner._download_inputs = _fake_download   # type: ignore[assignment]
+        runner._run_bundle = _fake_run_bundle      # type: ignore[assignment]
+        runner._upload_outputs = _fake_upload      # type: ignore[assignment]
+
+        out = await runner.run({"bundle_hash": "abc", "inputs": {"a": "/upload/x"}})
+        assert out == "out"
+        assert not os.path.isdir(captured["stage_dir"]), "stage dir must be removed after run"
+
+        # Cleanup also runs when the bundle raises mid-execution.
+        async def _boom(http, bundle_hash, msg, local_inputs, send_callback):
+            raise RuntimeError("boom")
+
+        runner._run_bundle = _boom  # type: ignore[assignment]
+        try:
+            await runner.run({"bundle_hash": "abc", "inputs": {}})
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("bundle error must propagate")
+        assert not os.path.isdir(captured["stage_dir"]), "stage dir must be removed on error"
+
+        print("icefold_runner.runner: OK")
+
+    _asyncio.run(_smoke())

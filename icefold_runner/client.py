@@ -13,7 +13,7 @@ import os
 import platform
 import random
 import time
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 from urllib.parse import urlencode, urlsplit, urlunsplit
 
 import websockets
@@ -93,7 +93,10 @@ class WorkerClient:
         # here as outbound ``node_callback`` frames keyed by ``req_id`` and
         # we await the server's matching ``node_callback_result`` to resolve
         # the bundle's future.
-        self._pending_callbacks: Dict[str, "asyncio.Future[dict]"] = {}
+        # Keyed by req_id → (call_id, future). The call_id scoping lets a
+        # finishing node fail ONLY its own pending callbacks, never a
+        # concurrently-running node's (multiple node_exec run at once).
+        self._pending_callbacks: Dict[str, Tuple[str, "asyncio.Future[dict]"]] = {}
         # Monotonic timestamp of the most recent successful connect, or None
         # while disconnected. Drives the healthy-drop backoff reset.
         self._connected_at: Optional[float] = None
@@ -237,9 +240,11 @@ class WorkerClient:
             # by req_id and feed it the result; the bundle's coroutine
             # resumes inside the node's task.
             req_id = msg.get("req_id", "")
-            fut = self._pending_callbacks.pop(req_id, None)
-            if fut is not None and not fut.done():
-                fut.set_result(msg)
+            entry = self._pending_callbacks.pop(req_id, None)
+            if entry is not None:
+                _cid, fut = entry
+                if not fut.done():
+                    fut.set_result(msg)
         elif mtype == SRV_PING:
             await self._send(ws, {"type": WKR_PONG})
 
@@ -288,17 +293,24 @@ class WorkerClient:
             })
         finally:
             self._tasks.pop(call_id, None)
-            # Fail any still-pending callbacks (e.g. the bundle was cancelled
-            # mid-LLM-call) so the bundle's awaiter doesn't hang on shutdown.
-            for req_id, fut in list(self._pending_callbacks.items()):
-                if not fut.done():
-                    fut.set_result({
-                        "type": SRV_NODE_CALLBACK_RESULT,
-                        "call_id": call_id, "req_id": req_id,
-                        "ok": False, "result": None,
-                        "error": "node ended before callback resolved",
-                    })
-                self._pending_callbacks.pop(req_id, None)
+            self._fail_pending_callbacks(call_id)
+
+    def _fail_pending_callbacks(self, call_id: str) -> None:
+        """Fail + drop only THIS node's still-pending callbacks (e.g. it was
+        cancelled mid-LLM-call) so its awaiter doesn't hang — without touching
+        a concurrently-running node's callbacks, which a flat sweep would
+        wrongly abort (spurious failure + dropped result on the other node)."""
+        for req_id, (cid, fut) in list(self._pending_callbacks.items()):
+            if cid != call_id:
+                continue
+            if not fut.done():
+                fut.set_result({
+                    "type": SRV_NODE_CALLBACK_RESULT,
+                    "call_id": call_id, "req_id": req_id,
+                    "ok": False, "result": None,
+                    "error": "node ended before callback resolved",
+                })
+            self._pending_callbacks.pop(req_id, None)
 
     def _make_send_callback(self, ws, call_id: str):
         """Return the bundle-host callback sender bound to one node_exec.
@@ -314,7 +326,7 @@ class WorkerClient:
         async def _send(kind: str, payload: dict):
             req_id = uuid.uuid4().hex
             fut: "asyncio.Future[dict]" = loop.create_future()
-            self._pending_callbacks[req_id] = fut
+            self._pending_callbacks[req_id] = (call_id, fut)
             try:
                 await self._send(ws, make_node_callback(
                     call_id=call_id, req_id=req_id, kind=kind, payload=payload,
@@ -347,3 +359,31 @@ class WorkerClient:
     def _redact(url: str) -> str:
         parts = urlsplit(url)
         return urlunsplit((parts.scheme, parts.netloc, parts.path, "token=<redacted>", ""))
+
+
+if __name__ == "__main__":
+    import asyncio as _asyncio
+
+    async def _smoke() -> None:
+        # A finishing node must fail ONLY its own pending callbacks, never a
+        # concurrently-running node's — the flat sweep used to abort every
+        # node's callbacks (spurious failures + dropped results).
+        client = WorkerClient(server="wss://x", token="t", worker_id="w")
+        loop = _asyncio.get_running_loop()
+        fa = loop.create_future()
+        fb = loop.create_future()
+        client._pending_callbacks["ra"] = ("A", fa)
+        client._pending_callbacks["rb"] = ("B", fb)
+
+        client._fail_pending_callbacks("A")
+        assert fa.done() and fa.result()["ok"] is False, "A's callback must fail"
+        assert "ra" not in client._pending_callbacks, "A's callback must drop"
+        assert not fb.done(), "B's in-flight callback must NOT be touched"
+        assert client._pending_callbacks.get("rb") == ("B", fb), "B's callback must remain"
+
+        client._fail_pending_callbacks("B")
+        assert fb.done() and "rb" not in client._pending_callbacks
+
+        print("icefold_runner.client: OK")
+
+    _asyncio.run(_smoke())
