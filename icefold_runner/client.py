@@ -76,6 +76,12 @@ _MAX_FRAME = 8 * 1024 * 1024
 # is a fresh incident, not part of a tight reconnect storm, so we reset the
 # backoff and reconnect fast instead of waiting out the escalated ceiling.
 _HEALTHY_UPTIME_S = 5.0
+# WebSocket close codes the SERVER sends on an orderly, expected teardown:
+# 1012 "service restart" (the backend's uvicorn going down for a deploy/restart)
+# and 1001 "going away". The runner did nothing wrong and reconnects within a
+# second, so these are routine reconnects — logged at info, not error, so genuine
+# faults aren't drowned out by deploy churn (every push to main restarts prod).
+_GRACEFUL_CLOSE_CODES = frozenset({1001, 1012})
 
 
 class AuthError(Exception):
@@ -84,6 +90,16 @@ class AuthError(Exception):
 
 def _log(level: str, msg: str, **kw) -> None:
     {"warn": log_warning, "error": log_error}.get(level, log_info)("worker", msg, **kw)
+
+
+def _server_close_code(e: Exception) -> Optional[int]:
+    """The close code the server sent us, if the drop was a clean WS closure.
+
+    ``websockets`` raises ``ConnectionClosed*`` carrying the received close frame
+    on ``.rcvd``; transport-level failures (DNS / TCP / handshake) have no
+    ``.rcvd``, so this returns ``None`` and the drop is treated as a real error.
+    """
+    return getattr(getattr(e, "rcvd", None), "code", None)
 
 
 class WorkerClient:
@@ -158,7 +174,15 @@ class WorkerClient:
                 # serving out a ceiling we only escalated to during real outages.
                 if self._was_healthy():
                     backoff = _BACKOFF_MIN
-                _log("error", f"connection failed: {e}", next_retry=round(backoff, 1))
+                code = _server_close_code(e)
+                if code in _GRACEFUL_CLOSE_CODES:
+                    # Server closed the link cleanly on its own (e.g. it was
+                    # restarted by a deploy). Reconnecting is the expected next
+                    # step, not a fault on our end — don't cry wolf at error.
+                    _log("info", f"server closed link for restart ({code}); reconnecting",
+                         next_retry=round(backoff, 1))
+                else:
+                    _log("error", f"connection failed: {e}", next_retry=round(backoff, 1))
             sleep = backoff + random.uniform(0, backoff / 4)
             await asyncio.sleep(sleep)
             backoff = min(backoff * 2, _BACKOFF_MAX)
@@ -399,6 +423,17 @@ if __name__ == "__main__":
 
         client._fail_pending_callbacks("B")
         assert fb.done() and "rb" not in client._pending_callbacks
+
+        # A server-initiated 1012 "service restart" (uvicorn going down on a
+        # deploy) is a routine reconnect, not an error — classify it as graceful.
+        from websockets.exceptions import ConnectionClosedError
+        from websockets.frames import Close
+        restart = ConnectionClosedError(Close(1012, "service restart"), None, None)
+        assert _server_close_code(restart) == 1012, "must read the server's close code"
+        assert _server_close_code(restart) in _GRACEFUL_CLOSE_CODES, "1012 must be graceful"
+        # A transport-level failure carries no close frame → treated as a real error.
+        assert _server_close_code(OSError("connection refused")) is None
+        assert _server_close_code(OSError("x")) not in _GRACEFUL_CLOSE_CODES
 
         print("icefold_runner.client: OK")
 
