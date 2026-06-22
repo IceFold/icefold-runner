@@ -11,7 +11,7 @@ and runs it. So upgrading or adding nodes on the server never requires updating
 the runner.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 __all__ = ["__version__", "WorkerClient", "NodeRunner"]
 
