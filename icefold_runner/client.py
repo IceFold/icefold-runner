@@ -8,6 +8,7 @@ Reconnects with jittered exponential backoff; an auth rejection is fatal.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import os
 import platform
@@ -17,6 +18,19 @@ from typing import Dict, Optional, Tuple
 from urllib.parse import urlencode, urlsplit, urlunsplit
 
 import websockets
+
+# The auth token rides in a header (not the URL query) so it can't be captured
+# by server access logs / proxies. websockets renamed the client header kwarg
+# (legacy ``extra_headers`` → ``additional_headers`` in the newer asyncio
+# client), so pick whichever this installed version exposes.
+try:
+    _WS_HEADERS_KW = (
+        "additional_headers"
+        if "additional_headers" in inspect.signature(websockets.connect).parameters
+        else "extra_headers"
+    )
+except (TypeError, ValueError):  # pragma: no cover - exotic websockets builds
+    _WS_HEADERS_KW = "extra_headers"
 
 import uuid
 
@@ -115,12 +129,11 @@ class WorkerClient:
         path = parts.path.rstrip("/")
         if not path.endswith("/v1/ws/worker"):
             path = path + "/v1/ws/worker"
-        # No user_id: the token encodes + signs it; the server derives the
-        # identity from the token so this runner can't claim another account.
-        query = urlencode({
-            "token": self.token,
-            "worker_id": self.worker_id,
-        })
+        # Only worker_id in the URL — the token goes in the ``X-Worker-Token``
+        # header (see ``_run_once``) so it never lands in an access log. No
+        # user_id: the token encodes + signs it; the server derives the identity
+        # from the token so this runner can't claim another account.
+        query = urlencode({"worker_id": self.worker_id})
         return urlunsplit((scheme, parts.netloc, path, query, ""))
 
     # ── main loop ──
@@ -159,11 +172,12 @@ class WorkerClient:
 
     async def _run_once(self) -> None:
         url = self._ws_url()
-        _log("info", "dialing", url=self._redact(url))
+        _log("info", "dialing", url=url)  # token is in a header now, not the URL
         try:
             ws = await websockets.connect(
                 url, max_size=_MAX_FRAME, open_timeout=15,
                 ping_interval=_KEEPALIVE_S, ping_timeout=_KEEPALIVE_S,
+                **{_WS_HEADERS_KW: {"X-Worker-Token": self.token}},
             )
         except Exception as e:  # noqa: BLE001
             if self._is_auth_rejection(e):
@@ -355,11 +369,6 @@ class WorkerClient:
         status = getattr(resp, "status_code", None) or getattr(e, "status_code", None)
         return status in (401, 403)
 
-    @staticmethod
-    def _redact(url: str) -> str:
-        parts = urlsplit(url)
-        return urlunsplit((parts.scheme, parts.netloc, parts.path, "token=<redacted>", ""))
-
 
 if __name__ == "__main__":
     import asyncio as _asyncio
@@ -369,6 +378,13 @@ if __name__ == "__main__":
         # concurrently-running node's — the flat sweep used to abort every
         # node's callbacks (spurious failures + dropped results).
         client = WorkerClient(server="wss://x", token="t", worker_id="w")
+
+        # Security: the token rides in the X-Worker-Token header, never the URL
+        # (so it can't be captured by access logs / proxies).
+        _url = client._ws_url()
+        assert "token=" not in _url, f"token must not be in the WS URL: {_url}"
+        assert "worker_id=w" in _url, _url
+
         loop = _asyncio.get_running_loop()
         fa = loop.create_future()
         fb = loop.create_future()
