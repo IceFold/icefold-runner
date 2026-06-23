@@ -71,6 +71,13 @@ class NodeRunner:
         # self-contained .py; once exec'd we keep the module around for the
         # lifetime of this runner process.
         self._bundles: Dict[str, ModuleType] = {}
+        # Per-hash locks so concurrent first-time jobs for the same bundle
+        # fetch+import it once instead of each racing through the cache miss
+        # (last-writer-wins duplicate work). Distinct hashes take distinct
+        # locks, so they never serialize against each other; get-or-create is
+        # await-free, so it's race-safe under the single-threaded event loop.
+        # Bounded by the bundle set, same as ``_bundles`` above.
+        self._bundle_locks: Dict[str, asyncio.Lock] = {}
         os.makedirs(_STAGED_DIR, exist_ok=True)
         os.makedirs(_BUNDLES_DIR, exist_ok=True)
 
@@ -124,9 +131,7 @@ class NodeRunner:
         """Fetch + pre-flight + exec a server-rendered self-contained bundle."""
         mod = self._bundles.get(bundle_hash)
         if mod is None:
-            bundle_path = await self._fetch_bundle(http, bundle_hash, msg.get("bundle_url") or "")
-            mod = self._import_bundle(bundle_hash, bundle_path)
-            self._bundles[bundle_hash] = mod
+            mod = await self._ensure_bundle(http, bundle_hash, msg)
 
         # Pre-flight declared deps (binary first, then python). Raise a typed
         # exception so the client wraps a ``missing_dep`` reply instead of
@@ -160,6 +165,29 @@ class NodeRunner:
                 f"bundle {bundle_hash[:8]} is missing __icefold_run__ entry point"
             )
         return await entry(local_inputs if isinstance(local_inputs, dict) else {}, ctx_dict)
+
+    async def _ensure_bundle(
+        self, http: httpx.AsyncClient, bundle_hash: str, msg: dict,
+    ) -> ModuleType:
+        """Fetch+import a bundle exactly once across concurrent jobs.
+
+        A per-hash lock collapses a thundering herd of first-time jobs for the
+        same bundle into a single fetch+import: without it, every job that
+        slipped past the cache miss before the winner repopulated the cache
+        would re-fetch and re-exec the module. The double-check inside the lock
+        hands the now-cached module to the jobs that queued behind the winner.
+        Distinct hashes take distinct locks, so they never wait on each other.
+        """
+        lock = self._bundle_locks.setdefault(bundle_hash, asyncio.Lock())
+        async with lock:
+            mod = self._bundles.get(bundle_hash)
+            if mod is None:
+                bundle_path = await self._fetch_bundle(
+                    http, bundle_hash, msg.get("bundle_url") or "",
+                )
+                mod = self._import_bundle(bundle_hash, bundle_path)
+                self._bundles[bundle_hash] = mod
+            return mod
 
     async def _fetch_bundle(
         self, http: httpx.AsyncClient, bundle_hash: str, bundle_url: str,
@@ -335,6 +363,42 @@ if __name__ == "__main__":
         else:
             raise AssertionError("bundle error must propagate")
         assert not os.path.isdir(captured["stage_dir"]), "stage dir must be removed on error"
+
+        # Concurrent first-time jobs for the SAME bundle hash must fetch+import
+        # it once, not once-per-job: the per-hash lock collapses the herd. The
+        # sleep(0) forces all three to reach the lock before the winner caches.
+        deduped = NodeRunner("http://x", "tok", lambda *a, **k: None)
+        calls = {"fetch": 0, "import": 0}
+
+        async def _counting_fetch(http, bundle_hash, bundle_url):
+            calls["fetch"] += 1
+            await _asyncio.sleep(0)
+            return "/bundles/x.py"
+
+        def _counting_import(bundle_hash, path):
+            calls["import"] += 1
+            return ModuleType(f"m_{bundle_hash}")
+
+        deduped._fetch_bundle = _counting_fetch    # type: ignore[assignment]
+        deduped._import_bundle = _counting_import  # type: ignore[assignment]
+
+        mods = await _asyncio.gather(
+            *(deduped._ensure_bundle(None, "samehash", {}) for _ in range(3))
+        )
+        assert calls["fetch"] == 1, f"one fetch for concurrent jobs, got {calls['fetch']}"
+        assert calls["import"] == 1, f"one import for concurrent jobs, got {calls['import']}"
+        assert all(m is mods[0] for m in mods), "all jobs must share the one module"
+
+        # Distinct hashes must NOT serialize on one lock: each gets its own.
+        d2 = NodeRunner("http://x", "tok", lambda *a, **k: None)
+        d2._fetch_bundle = _counting_fetch    # type: ignore[assignment]
+        d2._import_bundle = _counting_import  # type: ignore[assignment]
+        calls["fetch"] = calls["import"] = 0
+        await _asyncio.gather(
+            d2._ensure_bundle(None, "h1", {}), d2._ensure_bundle(None, "h2", {})
+        )
+        assert calls["fetch"] == 2 and calls["import"] == 2, "distinct hashes load independently"
+        assert len(d2._bundle_locks) == 2, "one lock per distinct hash"
 
         print("icefold_runner.runner: OK")
 
