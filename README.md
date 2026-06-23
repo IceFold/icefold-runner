@@ -74,7 +74,7 @@ icefold-runner --token <your-token>
 That's it — the token (GitHub-CI style) encodes + signs your IceFold user id, so
 there's no server URL or user id to pass. The server is built in.
 
-Every flag also reads an env var (see [`.env.example`](.env.example)):
+Every flag also reads an env var:
 
 | flag | env | meaning |
 |---|---|---|
@@ -87,24 +87,6 @@ server. It reconnects automatically with backoff; an auth rejection is fatal.
 
 > Self-hosting / dev: point the runner at a different server with the
 > `ICEFOLD_RUNNER_SERVER` env var (e.g. `ws://127.0.0.1:7000`).
-
-### Run as a service (systemd)
-
-```ini
-# /etc/systemd/system/icefold-runner.service
-[Unit]
-Description=IceFold runner
-After=network-online.target
-
-[Service]
-EnvironmentFile=/etc/icefold-runner.env
-ExecStart=/opt/icefold-runner/.venv/bin/icefold-runner
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-```
 
 ## Layout
 
@@ -132,13 +114,3 @@ itself, not by node code.
   point a runner at a server you trust.
 - The runner only talks to the one server you point it at, authenticated by the
   shared token; it pulls input files and pushes products over HTTP to that host.
-
-## Self-check
-
-A no-network sanity check that `icefold` is importable and the bundle execution
-path (fetch + import + run `__icefold_run__`) works against a locally-rendered
-bundle:
-
-```bash
-python selfcheck.py
-```

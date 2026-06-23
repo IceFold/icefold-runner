@@ -5,6 +5,7 @@ build/
 dist/
 .venv/
 venv/
+uv.lock
 
 # runner scratch (staged inputs + ffmpeg products)
 icefold-runner-data/
