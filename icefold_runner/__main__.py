@@ -23,6 +23,22 @@ import socket
 DEFAULT_SERVER = "wss://api.icefold.com"
 
 
+_DEFAULT_ROTATION = "7d"
+
+
+def _parse_duration(text: str, *, default: float) -> float:
+    """Parse ``30d`` / ``12h`` / ``90m`` / ``3600s`` (or a bare seconds number)
+    into seconds; fall back to ``default`` on anything unparseable."""
+    text = (text or "").strip().lower()
+    if not text:
+        return default
+    unit = {"s": 1, "m": 60, "h": 3600, "d": 86400}.get(text[-1])
+    try:
+        return max(0.0, float(text[:-1]) * unit if unit is not None else float(text))
+    except ValueError:
+        return default
+
+
 def _parse_args(argv):
     p = argparse.ArgumentParser(
         prog="icefold-runner",
@@ -36,6 +52,11 @@ def _parse_args(argv):
     p.add_argument("--work-dir",
                    default=os.environ.get("ICEFOLD_RUNNER_DIR", "") or os.path.abspath("./icefold-runner-data"),
                    help="Scratch dir for staged inputs + ffmpeg products. env: ICEFOLD_RUNNER_DIR")
+    p.add_argument("--rotation",
+                   default=os.environ.get("ICEFOLD_RUNNER_STAGED_ROTATION", "") or _DEFAULT_ROTATION,
+                   help="How long to keep staged input scratch before reaping it by "
+                        "age (e.g. 30d/12h/90m). Must exceed the longest node run. "
+                        f"env: ICEFOLD_RUNNER_STAGED_ROTATION (default: {_DEFAULT_ROTATION})")
     args = p.parse_args(argv)
 
     if not args.token:
@@ -63,6 +84,7 @@ def main(argv=None) -> int:
         server=server,
         token=args.token,
         worker_id=args.runner_id,
+        staged_retention_s=_parse_duration(args.rotation, default=7 * 86400),
     )
     try:
         asyncio.run(client.run_forever())

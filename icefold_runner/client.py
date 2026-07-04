@@ -110,13 +110,16 @@ class WorkerClient:
         token: str,
         worker_id: str,
         http_base: Optional[str] = None,
+        staged_retention_s: float = 7 * 86400,
     ) -> None:
         self.server = server
         self.token = token
         self.worker_id = worker_id
         self.xor_key = token.encode("utf-8") if token else b""
         self.http_base = (http_base or self._derive_http_base(server)).rstrip("/")
-        self.runner = NodeRunner(self.http_base, token, _log)
+        self.runner = NodeRunner(
+            self.http_base, token, _log, staged_retention_s=staged_retention_s,
+        )
         self._tasks: Dict[str, asyncio.Task] = {}
         # Bundle-host callback bookkeeping: bundle code reaches back into the
         # server via ``ctx.progress(...)`` / ``ctx.llm.text(...)``; those land
@@ -324,10 +327,18 @@ class WorkerClient:
             # awaiting future is already cancelled, so no node_done is needed.
             raise
         except Exception as e:  # noqa: BLE001
-            _log("error", f"node failed {node_type}: {e}", call_id=call_id)
+            import traceback
+            # ``repr`` (not ``str``) so a message-less exception — a bare
+            # ``AssertionError``/``RuntimeError()`` — still reports its class
+            # instead of a blank; the traceback pins where it came from.
+            _log(
+                "error",
+                f"node failed {node_type}: {e!r}\n{traceback.format_exc()}",
+                call_id=call_id,
+            )
             await self._safe_send(ws, {
                 "type": WKR_NODE_DONE, "call_id": call_id,
-                "output": None, "err": str(e), "killed": False,
+                "output": None, "err": str(e) or repr(e), "killed": False,
             })
         finally:
             self._tasks.pop(call_id, None)

@@ -32,6 +32,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 from types import ModuleType
 from typing import Any, Dict, List, Tuple
 
@@ -64,10 +65,15 @@ def _ext_from_ref(ref: str) -> str:
 class NodeRunner:
     """Stateless per-worker runner; one instance shared across jobs."""
 
-    def __init__(self, http_base: str, token: str, log) -> None:
+    def __init__(
+        self, http_base: str, token: str, log, *, staged_retention_s: float = 7 * 86400,
+    ) -> None:
         self._http_base = http_base.rstrip("/")
         self._token = token
         self._log = log
+        # Staged inputs are reaped by AGE (``_sweep_staged``), not per-run: a
+        # per-run rmtree could delete a file a still-running subprocess needs.
+        self._staged_retention_s = staged_retention_s
         # Cache of bundle modules keyed by bundle hash. A bundle is a
         # self-contained .py; once exec'd we keep the module around for the
         # lifetime of this runner process.
@@ -81,6 +87,30 @@ class NodeRunner:
         self._bundle_locks: Dict[str, asyncio.Lock] = {}
         os.makedirs(_STAGED_DIR, exist_ok=True)
         os.makedirs(_BUNDLES_DIR, exist_ok=True)
+        self._sweep_staged()
+
+    def _sweep_staged(self) -> None:
+        """Delete staged dirs older than the retention window.
+
+        Reaping by age — rather than an end-of-run ``rmtree`` — keeps a run from
+        ever deleting a staged file that another run, or a subprocess that
+        outlived its awaiting task (a cancelled/timed-out ffmpeg or stable-ts
+        keeps running in its worker thread), is still reading. Safe as long as
+        the window exceeds the node timeout, so an in-flight dir (mtime≈now) is
+        never swept out from under its own run.
+        """
+        try:
+            names = os.listdir(_STAGED_DIR)
+        except OSError:
+            return
+        cutoff = time.time() - self._staged_retention_s
+        for name in names:
+            path = os.path.join(_STAGED_DIR, name)
+            try:
+                if os.path.getmtime(path) < cutoff:
+                    shutil.rmtree(path, ignore_errors=True)
+            except OSError:
+                continue
 
     async def run(self, msg: dict, *, send_callback=None) -> Any:
         """Execute one ``node_exec`` frame against a server-rendered bundle.
@@ -103,21 +133,24 @@ class NodeRunner:
             )
         timeout = max(1.0, msg.get("timeout_ms", 1800_000) / 1000.0)
 
-        # Per-call staging dir for downloaded inputs, removed in finally: nothing
-        # else ever cleaned _STAGED_DIR, so a long-lived runner pulling media
-        # inputs would accumulate them until the disk filled (ENOSPC).
+        # Per-call staging dir for downloaded inputs. NOT removed at end-of-run:
+        # a per-run ``rmtree`` could pull a staged file out from under a
+        # subprocess that outlived the awaiting task (a cancelled/timed-out
+        # ffmpeg or stable-ts keeps running in its thread), which stranded
+        # concurrent ComposeVideo variants with "No such file". Reap by age
+        # instead — swept here before staging, so a fresh dir (mtime≈now) is
+        # never caught mid-run, while old dirs from finished runs still get
+        # collected before the disk fills (ENOSPC).
+        self._sweep_staged()
         stage_dir = os.path.join(_STAGED_DIR, os.urandom(8).hex())
         os.makedirs(stage_dir, exist_ok=True)
-        try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(600.0)) as http:
-                local_inputs = await self._download_inputs(http, msg.get("inputs") or {}, stage_dir)
-                output = await asyncio.wait_for(
-                    self._run_bundle(http, bundle_hash, msg, local_inputs, send_callback),
-                    timeout=timeout,
-                )
-                return await self._upload_outputs(http, output, msg.get("session_id", ""))
-        finally:
-            shutil.rmtree(stage_dir, ignore_errors=True)
+        async with httpx.AsyncClient(timeout=httpx.Timeout(600.0)) as http:
+            local_inputs = await self._download_inputs(http, msg.get("inputs") or {}, stage_dir)
+            output = await asyncio.wait_for(
+                self._run_bundle(http, bundle_hash, msg, local_inputs, send_callback),
+                timeout=timeout,
+            )
+            return await self._upload_outputs(http, output, msg.get("session_id", ""))
 
     # ── bundle path ──
 
@@ -342,10 +375,11 @@ if __name__ == "__main__":
     import tempfile
 
     async def _smoke() -> None:
-        # run() must remove its per-call staging dir on every path — staged
-        # input files were never cleaned, so a long-lived runner leaked disk.
+        # Staged dirs are reaped by AGE, not per-run: a fresh dir must survive its
+        # own run (an end-of-run rmtree once yanked staged files out from under a
+        # still-running subprocess); only dirs older than the window are swept.
         globals()["_STAGED_DIR"] = tempfile.mkdtemp()
-        runner = NodeRunner("http://x", "tok", lambda *a, **k: None)
+        runner = NodeRunner("http://x", "tok", lambda *a, **k: None, staged_retention_s=3600)
         captured: dict = {}
 
         async def _fake_download(http, inputs, stage_dir):
@@ -368,9 +402,20 @@ if __name__ == "__main__":
 
         out = await runner.run({"bundle_hash": "abc", "inputs": {"a": "/upload/x"}})
         assert out == "out"
-        assert not os.path.isdir(captured["stage_dir"]), "stage dir must be removed after run"
+        # NOT removed at end-of-run — the fresh dir (mtime≈now) survives.
+        assert os.path.isdir(captured["stage_dir"]), "fresh stage dir must survive its run"
 
-        # Cleanup also runs when the bundle raises mid-execution.
+        # A dir older than the retention window is reaped on the next run's sweep,
+        # while that run's own fresh dir is kept.
+        stale = os.path.join(_STAGED_DIR, "stale")
+        os.makedirs(stale, exist_ok=True)
+        os.utime(stale, (time.time() - 7200, time.time() - 7200))  # 2h old, window 1h
+        out2 = await runner.run({"bundle_hash": "abc", "inputs": {}})
+        assert out2 == "out"
+        assert not os.path.isdir(stale), "stale stage dir must be reaped by age"
+        assert os.path.isdir(captured["stage_dir"]), "the just-run dir must survive the sweep"
+
+        # A bundle error still propagates (no swallowing).
         async def _boom(http, bundle_hash, msg, local_inputs, send_callback):
             raise RuntimeError("boom")
 
@@ -381,7 +426,6 @@ if __name__ == "__main__":
             pass
         else:
             raise AssertionError("bundle error must propagate")
-        assert not os.path.isdir(captured["stage_dir"]), "stage dir must be removed on error"
 
         # Concurrent first-time jobs for the SAME bundle hash must fetch+import
         # it once, not once-per-job: the per-hash lock collapses the herd. The
