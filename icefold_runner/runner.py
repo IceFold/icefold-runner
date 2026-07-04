@@ -31,6 +31,7 @@ import importlib.util
 import os
 import shutil
 import sys
+import tempfile
 from types import ModuleType
 from typing import Any, Dict, List, Tuple
 
@@ -201,11 +202,29 @@ class NodeRunner:
         headers = {"X-Worker-Token": self._token} if self._token else {}
         async with http.stream("GET", url, headers=headers) as resp:
             resp.raise_for_status()
-            tmp = path + ".part"
-            with open(tmp, "wb") as fh:
-                async for chunk in resp.aiter_bytes(64 * 1024):
-                    fh.write(chunk)
-            os.replace(tmp, path)
+            # Unique temp file per writer. A shared, deterministic ``<hash>.py.part``
+            # races whenever two runner processes share this cache dir (a second
+            # runner instance, or an old + new container briefly overlapping across
+            # a restart): both open the same ``.part``, the first ``os.replace``
+            # moves it to ``<hash>.py``, and the second then hits ENOENT renaming a
+            # part file that's already gone. ``mkstemp`` gives each writer its own
+            # file; ``os.replace`` still publishes atomically, so the last writer
+            # wins with byte-identical content and neither sees ENOENT.
+            fd, tmp = tempfile.mkstemp(
+                dir=_BUNDLES_DIR, prefix=f"{bundle_hash}.", suffix=".py.part"
+            )
+            try:
+                with os.fdopen(fd, "wb") as fh:
+                    async for chunk in resp.aiter_bytes(64 * 1024):
+                        fh.write(chunk)
+                os.replace(tmp, path)
+            except BaseException:
+                # Don't leak the unique temp if the download or rename fails.
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
         # Sanity: re-hash + compare so a corrupted download can't silently exec.
         with open(path, "rb") as fh:
             got = hashlib.sha256(fh.read()).hexdigest()
@@ -399,6 +418,56 @@ if __name__ == "__main__":
         )
         assert calls["fetch"] == 2 and calls["import"] == 2, "distinct hashes load independently"
         assert len(d2._bundle_locks) == 2, "one lock per distinct hash"
+
+        # Cross-process fetch race: when two runner processes share the bundles
+        # cache dir, a fixed ``<hash>.py.part`` name made the loser hit ENOENT on
+        # os.replace (the winner had already moved the part file away). Drive
+        # concurrent _fetch_bundle calls directly (bypassing the per-hash lock,
+        # as separate processes would) and assert all succeed with a valid,
+        # hash-matching file and no leaked temp files.
+        class _FakeResp:
+            def __init__(self, data: bytes) -> None:
+                self._data = data
+
+            def raise_for_status(self) -> None:
+                pass
+
+            async def aiter_bytes(self, n: int):
+                for i in range(0, len(self._data), n):
+                    await _asyncio.sleep(0)  # interleave the concurrent writers
+                    yield self._data[i : i + n]
+
+        class _FakeStream:
+            def __init__(self, data: bytes) -> None:
+                self._data = data
+
+            async def __aenter__(self):
+                await _asyncio.sleep(0)
+                return _FakeResp(self._data)
+
+            async def __aexit__(self, *a):
+                return False
+
+        class _FakeHttp:
+            def __init__(self, data: bytes) -> None:
+                self._data = data
+
+            def stream(self, method, url, headers=None):
+                return _FakeStream(self._data)
+
+        globals()["_BUNDLES_DIR"] = tempfile.mkdtemp()
+        payload = b"print('bundle')\n" * 5000  # multi-chunk so writers interleave
+        real_hash = hashlib.sha256(payload).hexdigest()
+        fetcher = NodeRunner("http://x", "tok", lambda *a, **k: None)
+        paths = await _asyncio.gather(
+            *(fetcher._fetch_bundle(_FakeHttp(payload), real_hash, "") for _ in range(3))
+        )
+        final = os.path.join(_BUNDLES_DIR, f"{real_hash}.py")
+        assert all(p == final for p in paths), paths
+        with open(final, "rb") as fh:
+            assert hashlib.sha256(fh.read()).hexdigest() == real_hash, "cached bundle corrupt"
+        leftovers = [f for f in os.listdir(_BUNDLES_DIR) if f.endswith(".part")]
+        assert not leftovers, f"temp files leaked: {leftovers}"
 
         print("icefold_runner.runner: OK")
 
