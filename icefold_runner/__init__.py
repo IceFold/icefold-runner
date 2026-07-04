@@ -11,7 +11,15 @@ and runs it. So upgrading or adding nodes on the server never requires updating
 the runner.
 """
 
-__version__ = "0.1.1"
+from importlib.metadata import PackageNotFoundError, version as _pkg_version
+
+try:
+    # Single source of truth: the installed package metadata (pyproject version).
+    # Reading it here means the version can never drift from the wheel that's
+    # actually running — which a hardcoded literal silently does across releases.
+    __version__ = _pkg_version("icefold-runner")
+except PackageNotFoundError:  # running from a source tree that was never installed
+    __version__ = "0.0.0+dev"
 
 __all__ = ["__version__", "WorkerClient", "NodeRunner"]
 
