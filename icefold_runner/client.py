@@ -111,6 +111,7 @@ class WorkerClient:
         worker_id: str,
         http_base: Optional[str] = None,
         staged_retention_s: float = 7 * 86400,
+        concurrency: int = 4,
     ) -> None:
         self.server = server
         self.token = token
@@ -121,6 +122,12 @@ class WorkerClient:
             self.http_base, token, _log, staged_retention_s=staged_retention_s,
         )
         self._tasks: Dict[str, asyncio.Task] = {}
+        # Cap how many nodes execute at once. Dispatch is otherwise unbounded, so
+        # a fan-out (e.g. every ComposeVideo variant) would run all its heavy
+        # subprocesses concurrently — and GPU work (stable-ts) THRASHES when
+        # oversubscribed (N whisper models fighting for VRAM is far slower than
+        # running them one at a time). Excess nodes queue on this semaphore.
+        self._sem = asyncio.Semaphore(max(1, concurrency))
         # Bundle-host callback bookkeeping: bundle code reaches back into the
         # server via ``ctx.progress(...)`` / ``ctx.llm.text(...)``; those land
         # here as outbound ``node_callback`` frames keyed by ``req_id`` and
@@ -295,7 +302,12 @@ class WorkerClient:
         try:
             _log("info", f"running node {node_type}", call_id=call_id)
             send_callback = self._make_send_callback(ws, call_id)
-            output = await self.runner.run(msg, send_callback=send_callback)
+            # Gate execution (not the WS bookkeeping) so excess dispatched nodes
+            # queue here instead of oversubscribing CPU/GPU. A node cancelled
+            # while queued raises CancelledError out of the acquire — handled
+            # below like any other cancel.
+            async with self._sem:
+                output = await self.runner.run(msg, send_callback=send_callback)
             await self._send(ws, {
                 "type": WKR_NODE_DONE, "call_id": call_id,
                 "output": output, "err": "", "killed": False,

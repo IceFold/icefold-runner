@@ -57,6 +57,11 @@ def _parse_args(argv):
                    help="How long to keep staged input scratch before reaping it by "
                         "age (e.g. 30d/12h/90m). Must exceed the longest node run. "
                         f"env: ICEFOLD_RUNNER_STAGED_ROTATION (default: {_DEFAULT_ROTATION})")
+    p.add_argument("--concurrency", type=int,
+                   default=int(os.environ.get("ICEFOLD_RUNNER_CONCURRENCY", "") or (os.cpu_count() or 4)),
+                   help="Max nodes to execute at once; excess queue. Keep low for "
+                        "GPU-bound work (subtitle stable-ts) — 1 avoids VRAM thrashing. "
+                        "env: ICEFOLD_RUNNER_CONCURRENCY (default: CPU count)")
     args = p.parse_args(argv)
 
     if not args.token:
@@ -85,6 +90,7 @@ def main(argv=None) -> int:
         token=args.token,
         worker_id=args.runner_id,
         staged_retention_s=_parse_duration(args.rotation, default=7 * 86400),
+        concurrency=args.concurrency,
     )
     try:
         asyncio.run(client.run_forever())
