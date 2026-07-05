@@ -277,6 +277,12 @@ class WorkerClient:
             call_id = msg.get("call_id", "")
             if not call_id:
                 return
+            # Dedup a redelivered call_id on the same connection: overwriting the
+            # entry would orphan the still-running first task (its finally would
+            # later pop the second task's slot, leaving it untracked/uncancelable).
+            if call_id in self._tasks:
+                _log("warn", f"duplicate node_exec call_id {call_id!r}; ignoring redelivery")
+                return
             self._tasks[call_id] = asyncio.create_task(self._run_node(ws, msg))
         elif mtype == SRV_CANCEL:
             task = self._tasks.get(msg.get("call_id", ""))
@@ -353,7 +359,10 @@ class WorkerClient:
                 "output": None, "err": str(e) or repr(e), "killed": False,
             })
         finally:
-            self._tasks.pop(call_id, None)
+            # Pop only if this slot is still OURS — never evict a different task
+            # that a (guarded, but be defensive) same-id redelivery registered.
+            if self._tasks.get(call_id) is asyncio.current_task():
+                self._tasks.pop(call_id, None)
             self._fail_pending_callbacks(call_id)
 
     def _fail_pending_callbacks(self, call_id: str) -> None:

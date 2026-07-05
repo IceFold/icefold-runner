@@ -131,7 +131,10 @@ class NodeRunner:
                 f"node_exec for {node_type!r} arrived without bundle_hash; "
                 "the server must render a bundle via codegen before dispatch"
             )
-        timeout = max(1.0, msg.get("timeout_ms", 1800_000) / 1000.0)
+        # ``or`` (not the .get default) so an explicit ``timeout_ms: null`` / 0
+        # from any caller of this public framework falls back to the default
+        # instead of raising ``TypeError`` on ``None / 1000``.
+        timeout = max(1.0, (msg.get("timeout_ms") or 1800_000) / 1000.0)
 
         # Per-call staging dir for downloaded inputs. NOT removed at end-of-run:
         # a per-run ``rmtree`` could pull a staged file out from under a
@@ -140,8 +143,10 @@ class NodeRunner:
         # concurrent ComposeVideo variants with "No such file". Reap by age
         # instead — swept here before staging, so a fresh dir (mtime≈now) is
         # never caught mid-run, while old dirs from finished runs still get
-        # collected before the disk fills (ENOSPC).
-        self._sweep_staged()
+        # collected before the disk fills (ENOSPC). Off the event loop: the
+        # listdir/getmtime/rmtree are blocking and a large reap backlog would
+        # otherwise stall every concurrent node's awaits + the WS keepalive.
+        await asyncio.to_thread(self._sweep_staged)
         stage_dir = os.path.join(_STAGED_DIR, os.urandom(8).hex())
         os.makedirs(stage_dir, exist_ok=True)
         async with httpx.AsyncClient(timeout=httpx.Timeout(600.0)) as http:
@@ -341,9 +346,12 @@ class NodeRunner:
 
     async def _upload_outputs(self, http: httpx.AsyncClient, output: Any, session_id: str) -> Any:
         if isinstance(output, str):
-            if output and os.path.isfile(output) and os.path.abspath(output).startswith(
-                os.path.abspath(DATA_DIR)
-            ):
+            # Containment check with a separator boundary — a bare ``startswith``
+            # would treat a sibling like ``<DATA_DIR>-tmp/x`` as inside DATA_DIR.
+            abs_data = os.path.abspath(DATA_DIR)
+            abs_out = os.path.abspath(output) if output else ""
+            within = abs_out == abs_data or abs_out.startswith(abs_data + os.sep)
+            if output and within and os.path.isfile(output):
                 return await self._upload_one(http, output, session_id)
             return output
         if isinstance(output, dict):

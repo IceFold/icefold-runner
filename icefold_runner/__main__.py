@@ -58,10 +58,11 @@ def _parse_args(argv):
                         "age (e.g. 30d/12h/90m). Must exceed the longest node run. "
                         f"env: ICEFOLD_RUNNER_STAGED_ROTATION (default: {_DEFAULT_ROTATION})")
     p.add_argument("--concurrency", type=int,
-                   default=int(os.environ.get("ICEFOLD_RUNNER_CONCURRENCY", "") or (os.cpu_count() or 4)),
+                   default=int(os.environ.get("ICEFOLD_RUNNER_CONCURRENCY", "") or 4),
                    help="Max nodes to execute at once; excess queue. Keep low for "
-                        "GPU-bound work (subtitle stable-ts) — 1 avoids VRAM thrashing. "
-                        "env: ICEFOLD_RUNNER_CONCURRENCY (default: CPU count)")
+                        "GPU-bound work (subtitle stable-ts) — 1 avoids VRAM thrashing; "
+                        "raise it for CPU-bound built-ins. "
+                        "env: ICEFOLD_RUNNER_CONCURRENCY (default: 4)")
     args = p.parse_args(argv)
 
     if not args.token:
@@ -85,11 +86,22 @@ def main(argv=None) -> int:
 
     from icefold_runner.client import WorkerClient
 
+    # The staged-reap window MUST exceed the longest node run, else _sweep_staged
+    # (which runs at the start of each run, before the new stage dir is created)
+    # could delete a concurrently-running sibling's stage dir. Floor it so a
+    # mistyped tiny/0 --rotation can't re-enable that "No such file" race.
+    retention = _parse_duration(args.rotation, default=7 * 86400)
+    min_retention = 3600.0
+    if retention < min_retention:
+        print(f"icefold-runner: --rotation {args.rotation!r} is below the "
+              f"{int(min_retention)}s floor; using {int(min_retention)}s")
+        retention = min_retention
+
     client = WorkerClient(
         server=server,
         token=args.token,
         worker_id=args.runner_id,
-        staged_retention_s=_parse_duration(args.rotation, default=7 * 86400),
+        staged_retention_s=retention,
         concurrency=args.concurrency,
     )
     try:
