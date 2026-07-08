@@ -14,7 +14,7 @@ Per call:
   3. pre-flight the declared deps (``shutil.which`` + ``import_module``);
      surface ``MissingDependencyError`` so the client wraps a structured
      ``missing_dep`` reply instead of ``node_done``
-  4. download ``/files/`` & ``/tmp/`` input refs to a staging dir and
+  4. download ``/files/`` & ``/scratch/`` input refs to a staging dir and
      rewrite them to local paths
   5. await ``__icefold_run__(local_inputs, ctx_dict)``
   6. upload product files back to the server and rewrite the output to the
@@ -51,10 +51,10 @@ _BUNDLES_DIR = os.path.join(DATA_DIR, "bundles")
 
 def _is_server_ref(value: Any) -> bool:
     # Server file-plane mounts the worker GETs its inputs from: ``/files`` (the
-    # persistent Library store) and ``/tmp`` (ephemeral scratch). A ``/tmp/``
+    # persistent Library store) and ``/scratch`` (ephemeral scratch). A ``/scratch/``
     # ref is a SERVER URL path to fetch, never a runner-local absolute path.
     return isinstance(value, str) and (
-        value.startswith("/files/") or value.startswith("/tmp/")
+        value.startswith("/files/") or value.startswith("/scratch/")
     )
 
 
