@@ -47,8 +47,15 @@ the server's restricted sandbox.
 
 ## Install
 
-Requires **Python ≥ 3.11**, **ffmpeg/ffprobe** on `PATH` (for media nodes), and
-whatever third-party packages your custom nodes import.
+Requires only **Python ≥ 3.11** (it pulls in `icefold-sdk`).
+
+The runner itself ships no node tooling. A node declares what it needs in its
+bundle header — `binary_deps` (e.g. `ffmpeg` / `ffprobe` on `PATH` for media
+nodes) and `python_deps` (whatever your custom nodes import) — and the runner
+**pre-flights those before each run**, replying with a platform-aware install
+hint (`missing_dep`) for anything absent. So you install a node's dependencies
+only when you actually run a job that needs them, and the runner tells you
+exactly what to install.
 
 ```bash
 pip install icefold-runner          # pulls in icefold-sdk
