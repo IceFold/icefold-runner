@@ -187,6 +187,10 @@ class NodeRunner:
             "session_id": msg.get("session_id") or None,
             "space_name": msg.get("space_name") or None,
             "variant": msg.get("variant") or {},
+            # Dimension defs (id / values / tags) travel in the frame so the
+            # bundle's NodeContext can answer variant_has_tag / resolve_by_tag
+            # the same as an in-process run.
+            "dims": msg.get("dims") or [],
             "raw_inputs": local_inputs if isinstance(local_inputs, dict) else {},
             "provider": msg.get("provider") or {},
             "model": msg.get("model", ""),

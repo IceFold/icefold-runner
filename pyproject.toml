@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "icefold-runner"
-version = "0.1.5"
+version = "0.1.6"
 description = "Self-hosted execution runner for IceFold nodes (reverse-connects to an IceFold server, like a self-hosted CI runner)."
 readme = "README.md"
 requires-python = ">=3.11"
