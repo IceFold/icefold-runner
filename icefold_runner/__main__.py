@@ -78,8 +78,10 @@ def main(argv=None) -> int:
     server = os.environ.get("ICEFOLD_RUNNER_SERVER", "").strip() or DEFAULT_SERVER
 
     work_dir = os.path.abspath(args.work_dir)
-    os.makedirs(os.path.join(work_dir, "data", "download"), exist_ok=True)
-    os.makedirs(os.path.join(work_dir, "data", "upload"), exist_ok=True)
+    # ``tmp`` = where a node writes its products (icefold.config.TMP_BASE_DIR);
+    # ``staged`` = where fetched input files land before a run.
+    os.makedirs(os.path.join(work_dir, "data", "tmp"), exist_ok=True)
+    os.makedirs(os.path.join(work_dir, "data", "staged"), exist_ok=True)
 
     # Must precede any icefold import so DATA_DIR resolves under work_dir.
     os.environ["ICEFOLD_PROJECT_ROOT"] = work_dir

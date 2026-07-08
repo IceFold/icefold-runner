@@ -14,7 +14,7 @@ Per call:
   3. pre-flight the declared deps (``shutil.which`` + ``import_module``);
      surface ``MissingDependencyError`` so the client wraps a structured
      ``missing_dep`` reply instead of ``node_done``
-  4. download ``/upload/`` & ``/download/`` input refs to a staging dir and
+  4. download ``/files/`` & ``/tmp/`` input refs to a staging dir and
      rewrite them to local paths
   5. await ``__icefold_run__(local_inputs, ctx_dict)``
   6. upload product files back to the server and rewrite the output to the
@@ -50,8 +50,11 @@ _BUNDLES_DIR = os.path.join(DATA_DIR, "bundles")
 
 
 def _is_server_ref(value: Any) -> bool:
+    # Server file-plane mounts the worker GETs its inputs from: ``/files`` (the
+    # persistent Library store) and ``/tmp`` (ephemeral scratch). A ``/tmp/``
+    # ref is a SERVER URL path to fetch, never a runner-local absolute path.
     return isinstance(value, str) and (
-        value.startswith("/upload/") or value.startswith("/download/")
+        value.startswith("/files/") or value.startswith("/tmp/")
     )
 
 
@@ -412,7 +415,7 @@ if __name__ == "__main__":
         runner._run_bundle = _fake_run_bundle      # type: ignore[assignment]
         runner._upload_outputs = _fake_upload      # type: ignore[assignment]
 
-        out = await runner.run({"bundle_hash": "abc", "inputs": {"a": "/upload/x"}})
+        out = await runner.run({"bundle_hash": "abc", "inputs": {"a": "/files/x"}})
         assert out == "out"
         # NOT removed at end-of-run — the fresh dir (mtime≈now) survives.
         assert os.path.isdir(captured["stage_dir"]), "fresh stage dir must survive its run"
