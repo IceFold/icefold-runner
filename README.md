@@ -7,8 +7,8 @@ inbound ports, no public IP, no tunnel), receives node-execution jobs, runs them
 locally, and streams results back.
 
 It is the place where **your uploaded node code runs** — on your hardware, with
-full `subprocess` / `ffmpeg` / GPU / any-dependency access — instead of inside
-the server's restricted sandbox.
+full `subprocess` / `ffmpeg` / GPU / any-dependency access. The IceFold server
+never executes third-party code; it only renders it into bundles for a runner.
 
 ## How it works
 
@@ -26,9 +26,9 @@ the server's restricted sandbox.
 ```
 
 - **Control plane** rides the reverse WebSocket (`node_exec` / `cancel` →
-  `node_status` / `node_done` / `missing_dep`), JSON frames XOR-obfuscated with
-  the token (TLS still does the real protection). Each `node_exec` frame only
-  carries a `bundle_hash` and a single already-sliced variant — no source.
+  `node_status` / `node_done` / `missing_dep`) as plain JSON text frames — TLS
+  (wss) is the confidentiality layer. Each `node_exec` frame only carries a
+  `bundle_hash` and a single already-sliced variant — no source.
 - **Bulk media + bundles** ride plain HTTP: the runner GETs inputs from the
   server's `/upload` & `/download` and node bundles from `/v1/bundles/<hash>`
   (sha256-addressed, cached locally as `runner_work_dir/bundles/<hash>.py`,
@@ -114,8 +114,8 @@ itself, not by node code.
 ## Security model
 
 - Node code runs **unsandboxed** here — it's your machine, your risk. That's the
-  point: code the server sandbox forbids (subprocess/ffmpeg/native deps) runs on
-  the runner instead. The runner downloads each bundle from the server and
+  point: code the server refuses to execute (subprocess/ffmpeg/native deps and
+  anything third-party) runs on the runner instead. The runner downloads each bundle from the server and
   executes it; it verifies the bundle's sha256 matches the requested hash, but
   the bundle itself is whatever the server you authenticated to sends. Only
   point a runner at a server you trust.
