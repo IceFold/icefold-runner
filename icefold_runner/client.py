@@ -34,7 +34,6 @@ except (TypeError, ValueError):  # pragma: no cover - exotic websockets builds
 
 import uuid
 
-from icefold.crypto import xor_bytes
 from icefold.exceptions import MissingDependencyError
 from icefold.wire import (
     SRV_CANCEL,
@@ -116,7 +115,6 @@ class WorkerClient:
         self.server = server
         self.token = token
         self.worker_id = worker_id
-        self.xor_key = token.encode("utf-8") if token else b""
         self.http_base = (http_base or self._derive_http_base(server)).rstrip("/")
         self.runner = NodeRunner(
             self.http_base, token, _log, staged_retention_s=staged_retention_s,
@@ -253,21 +251,18 @@ class WorkerClient:
     # ── frame codec ──
 
     def _decode(self, raw) -> Optional[dict]:
+        # Frames are plain JSON text over the WS (TLS is the confidentiality
+        # layer); a binary frame is decoded as UTF-8 for tolerance.
         try:
             if isinstance(raw, (bytes, bytearray)):
-                data = xor_bytes(bytes(raw), self.xor_key) if self.xor_key else bytes(raw)
-                return json.loads(data.decode("utf-8"))
+                return json.loads(bytes(raw).decode("utf-8"))
             return json.loads(raw)
         except Exception as e:  # noqa: BLE001
             _log("warn", f"bad frame from server: {e}")
             return None
 
     async def _send(self, ws, msg: dict) -> None:
-        payload = json.dumps(msg).encode("utf-8")
-        if self.xor_key:
-            await ws.send(xor_bytes(payload, self.xor_key))
-        else:
-            await ws.send(payload.decode("utf-8"))
+        await ws.send(json.dumps(msg))
 
     # ── dispatch ──
 
@@ -440,6 +435,22 @@ if __name__ == "__main__":
         _url = client._ws_url()
         assert "token=" not in _url, f"token must not be in the WS URL: {_url}"
         assert "worker_id=w" in _url, _url
+
+        # Frames are plain JSON text — no XOR keystream. ``_send`` emits a JSON
+        # string; ``_decode`` round-trips both a text and a UTF-8 binary frame.
+        class _FakeWS:
+            def __init__(self):
+                self.sent = []
+
+            async def send(self, s):
+                self.sent.append(s)
+
+        fake = _FakeWS()
+        await client._send(fake, {"type": "hello", "worker_id": "w", "emoji": "你好"})
+        assert len(fake.sent) == 1 and isinstance(fake.sent[0], str)
+        assert json.loads(fake.sent[0]) == {"type": "hello", "worker_id": "w", "emoji": "你好"}
+        assert client._decode(fake.sent[0])["emoji"] == "你好"
+        assert client._decode(fake.sent[0].encode("utf-8"))["emoji"] == "你好"
 
         loop = _asyncio.get_running_loop()
         fa = loop.create_future()
