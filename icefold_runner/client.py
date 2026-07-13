@@ -13,6 +13,7 @@ import json
 import os
 import platform
 import random
+import socket
 import time
 from typing import Dict, Optional, Tuple
 from urllib.parse import urlencode, urlsplit, urlunsplit
@@ -48,6 +49,7 @@ from icefold.wire import (
     make_node_callback,
 )
 from icefold_runner import __version__ as VERSION
+from icefold_runner.identity import default_cpu_lane
 from icefold_runner.runner import NodeRunner
 from icefold import log_error, log_info, log_warning
 
@@ -110,8 +112,11 @@ class WorkerClient:
         worker_id: str,
         http_base: Optional[str] = None,
         staged_retention_s: float = 7 * 86400,
-        concurrency: int = 4,
+        concurrency: Optional[int] = None,
+        gpu_concurrency: int = 1,
     ) -> None:
+        if concurrency is None:
+            concurrency = default_cpu_lane()
         self.server = server
         self.token = token
         self.worker_id = worker_id
@@ -120,12 +125,24 @@ class WorkerClient:
             self.http_base, token, _log, staged_retention_s=staged_retention_s,
         )
         self._tasks: Dict[str, asyncio.Task] = {}
-        # Cap how many nodes execute at once. Dispatch is otherwise unbounded, so
-        # a fan-out (e.g. every ComposeVideo variant) would run all its heavy
-        # subprocesses concurrently — and GPU work (stable-ts) THRASHES when
-        # oversubscribed (N whisper models fighting for VRAM is far slower than
-        # running them one at a time). Excess nodes queue on this semaphore.
+        # TWO LANES. Dispatch is otherwise unbounded, so a fan-out would run all
+        # its heavy subprocesses at once — but the right cap differs sharply by
+        # what the node contends for:
+        #
+        #   cpu lane — ffmpeg muxing/transcode, movis, PIL. Scales with cores;
+        #     running several is a genuine speedup.
+        #   gpu lane — anything that loads a model into VRAM (``stable-ts``, so
+        #     ComposeVideo). Oversubscribing THRASHES: N whisper models fighting
+        #     over one card is far slower than running them one after another.
+        #     Serialized by default, and that default is load-bearing.
+        #
+        # The server tags each node_exec with ``gpu``. A frame that carries no
+        # such key came from a pre-lane server, which assumed a single serialized
+        # semaphore — so it goes in the GPU lane and everything serializes,
+        # exactly as that server expects. Fail-safe, not fail-fast: the cost is
+        # lost parallelism for one deploy window, not a melted GPU.
         self._sem = asyncio.Semaphore(max(1, concurrency))
+        self._gpu_sem = asyncio.Semaphore(max(1, gpu_concurrency))
         # Bundle-host callback bookkeeping: bundle code reaches back into the
         # server via ``ctx.progress(...)`` / ``ctx.llm.text(...)``; those land
         # here as outbound ``node_callback`` frames keyed by ``req_id`` and
@@ -222,6 +239,10 @@ class WorkerClient:
                 "version": VERSION,
                 # Shown in Settings → Runners ("Linux" / "Darwin" / "Windows").
                 "os": platform.system(),
+                # The machine this runner is on. Since ``worker_id`` became a
+                # per-process id, THIS is the human-recognisable label — and two
+                # runners on one box now show the same host, which is the point.
+                "host": socket.gethostname(),
                 "capabilities": ["builtin"],
             })
             self._connected_at = time.monotonic()
@@ -301,13 +322,18 @@ class WorkerClient:
         call_id = msg["call_id"]
         node_type = msg.get("node_type", "")
         try:
-            _log("info", f"running node {node_type}", call_id=call_id)
             send_callback = self._make_send_callback(ws, call_id)
+            # Pick the lane. Missing key (pre-lane server) → GPU lane, i.e.
+            # serialized: see __init__.
+            gpu = bool(msg.get("gpu", True))
+            lane = self._gpu_sem if gpu else self._sem
+            _log("info", f"running node {node_type}", call_id=call_id,
+                 lane="gpu" if gpu else "cpu")
             # Gate execution (not the WS bookkeeping) so excess dispatched nodes
-            # queue here instead of oversubscribing CPU/GPU. A node cancelled
-            # while queued raises CancelledError out of the acquire — handled
-            # below like any other cancel.
-            async with self._sem:
+            # queue here instead of oversubscribing the card or the cores. A node
+            # cancelled while queued raises CancelledError out of the acquire —
+            # handled below like any other cancel.
+            async with lane:
                 output = await self.runner.run(msg, send_callback=send_callback)
             await self._send(ws, {
                 "type": WKR_NODE_DONE, "call_id": call_id,
@@ -477,6 +503,37 @@ if __name__ == "__main__":
         # A transport-level failure carries no close frame → treated as a real error.
         assert _server_close_code(OSError("connection refused")) is None
         assert _server_close_code(OSError("x")) not in _GRACEFUL_CLOSE_CODES
+
+        # ── Lanes ──
+        # The two semaphores are separate objects with separate widths: a GPU
+        # node must never be able to consume CPU-lane capacity, or a ComposeVideo
+        # fan-out would put N whisper models on the card at once.
+        lanes = WorkerClient(
+            server="wss://x", token="t", worker_id="w",
+            concurrency=8, gpu_concurrency=1,
+        )
+        assert lanes._sem is not lanes._gpu_sem
+        assert lanes._sem._value == 8 and lanes._gpu_sem._value == 1
+
+        def _lane_for(msg: dict):
+            """The lane pick, exactly as _run_node computes it."""
+            return lanes._gpu_sem if bool(msg.get("gpu", True)) else lanes._sem
+
+        assert _lane_for({"gpu": True}) is lanes._gpu_sem      # ComposeVideo
+        assert _lane_for({"gpu": False}) is lanes._sem         # EditVideo & co
+        # NO key at all = a server that predates lanes, which assumed ONE
+        # serialized semaphore. Fail SAFE: serialize. Reading a missing key as
+        # False would put every node — whisper included — in the parallel lane
+        # and melt the card for one deploy window.
+        assert _lane_for({}) is lanes._gpu_sem
+
+        # Both lanes floor at 1: a 0 or negative override must not deadlock the
+        # runner into accepting nodes it can never start.
+        floored = WorkerClient(
+            server="wss://x", token="t", worker_id="w",
+            concurrency=0, gpu_concurrency=-3,
+        )
+        assert floored._sem._value == 1 and floored._gpu_sem._value == 1
 
         print("icefold_runner.client: OK")
 

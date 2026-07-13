@@ -16,7 +16,11 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
-import socket
+
+# Lane width + runner identity are runner policy, not CLI policy — the CLI only
+# surfaces them as overridable defaults. They live in their own module because it
+# imports no ``icefold``: see the bootstrap-order note above.
+from icefold_runner.identity import default_cpu_lane, new_runner_id
 
 # Built-in server. Self-hosters / dev can override via the ICEFOLD_RUNNER_SERVER
 # env var (intentionally not a CLI flag — the normal user never sets it).
@@ -47,8 +51,13 @@ def _parse_args(argv):
     )
     p.add_argument("--token", default=os.environ.get("ICEFOLD_RUNNER_TOKEN", ""),
                    help="Runner token from the IceFold app. env: ICEFOLD_RUNNER_TOKEN")
-    p.add_argument("--runner-id", default=os.environ.get("ICEFOLD_RUNNER_ID", "") or socket.gethostname(),
-                   help="Stable id for this runner (default: hostname). env: ICEFOLD_RUNNER_ID")
+    p.add_argument("--runner-id", default=os.environ.get("ICEFOLD_RUNNER_ID", "") or new_runner_id(),
+                   help="Id for this runner process (default: a fresh random id). "
+                        "The server keys its registry on this, so two runners "
+                        "sharing one id EVICT each other in a loop — which is "
+                        "what the old hostname default did to a second runner on "
+                        "the same machine. Set it only if you want a stable name "
+                        "and know you run exactly one. env: ICEFOLD_RUNNER_ID")
     p.add_argument("--work-dir",
                    default=os.environ.get("ICEFOLD_RUNNER_DIR", "") or os.path.abspath("./icefold-runner-data"),
                    help="Scratch dir for staged inputs + ffmpeg products. env: ICEFOLD_RUNNER_DIR")
@@ -58,11 +67,19 @@ def _parse_args(argv):
                         "age (e.g. 30d/12h/90m). Must exceed the longest node run. "
                         f"env: ICEFOLD_RUNNER_STAGED_ROTATION (default: {_DEFAULT_ROTATION})")
     p.add_argument("--concurrency", type=int,
-                   default=int(os.environ.get("ICEFOLD_RUNNER_CONCURRENCY", "") or 4),
-                   help="Max nodes to execute at once; excess queue. Keep low for "
-                        "GPU-bound work (subtitle stable-ts) — 1 avoids VRAM thrashing; "
-                        "raise it for CPU-bound built-ins. "
-                        "env: ICEFOLD_RUNNER_CONCURRENCY (default: 4)")
+                   default=int(os.environ.get("ICEFOLD_RUNNER_CONCURRENCY", "") or default_cpu_lane()),
+                   help="Max CPU-lane nodes at once (ffmpeg, movis, PIL); excess "
+                        "queue. Scales with cores. GPU work is NOT in this lane — "
+                        "see --gpu-concurrency. "
+                        f"env: ICEFOLD_RUNNER_CONCURRENCY (default: {default_cpu_lane()} here)")
+    p.add_argument("--gpu-concurrency", type=int,
+                   default=int(os.environ.get("ICEFOLD_RUNNER_GPU_CONCURRENCY", "") or 1),
+                   help="Max GPU-lane nodes at once — anything that loads a model "
+                        "into VRAM (stable-ts, so ComposeVideo). 1 is the right "
+                        "answer on one card: two whisper models fighting over it "
+                        "are far SLOWER than running them back to back. Raise only "
+                        "if you have the VRAM to prove otherwise. "
+                        "env: ICEFOLD_RUNNER_GPU_CONCURRENCY (default: 1)")
     args = p.parse_args(argv)
 
     if not args.token:
@@ -105,6 +122,7 @@ def main(argv=None) -> int:
         worker_id=args.runner_id,
         staged_retention_s=retention,
         concurrency=args.concurrency,
+        gpu_concurrency=args.gpu_concurrency,
     )
     try:
         asyncio.run(client.run_forever())
