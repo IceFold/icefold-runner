@@ -1,7 +1,7 @@
 """Reverse WebSocket client for icefold-runner.
 
-Dials out to ``<server>/v1/ws/worker``, authenticates with the shared token
-(also the XOR keystream), then serves leaf ``node_exec`` jobs concurrently.
+Dials out to ``<server>/v1/ws/worker``, authenticates with a runner token in
+the ``X-Worker-Token`` header, then serves leaf ``node_exec`` jobs concurrently.
 Reconnects with jittered exponential backoff; an auth rejection is fatal.
 """
 
@@ -21,9 +21,8 @@ from urllib.parse import urlencode, urlsplit, urlunsplit
 import websockets
 
 # The auth token rides in a header (not the URL query) so it can't be captured
-# by server access logs / proxies. websockets renamed the client header kwarg
-# (legacy ``extra_headers`` → ``additional_headers`` in the newer asyncio
-# client), so pick whichever this installed version exposes.
+# by server access logs / proxies. Supported websockets releases expose one of
+# two client-header keyword names, so pick the one this installation accepts.
 try:
     _WS_HEADERS_KW = (
         "additional_headers"
@@ -43,6 +42,7 @@ from icefold.wire import (
     SRV_PING,
     WKR_HELLO,
     WKR_NODE_DONE,
+    WKR_NODE_STATUS,
     WKR_PONG,
     WKR_PING,
     make_missing_dep,
@@ -327,13 +327,36 @@ class WorkerClient:
             # serialized: see __init__.
             gpu = bool(msg.get("gpu", True))
             lane = self._gpu_sem if gpu else self._sem
-            _log("info", f"running node {node_type}", call_id=call_id,
-                 lane="gpu" if gpu else "cpu")
+            lane_name = "gpu" if gpu else "cpu"
+            queued_at = time.monotonic()
+            await self._safe_send(ws, {
+                "type": WKR_NODE_STATUS,
+                "call_id": call_id,
+                "phase": "queued",
+                "node_type": node_type,
+                "lane": lane_name,
+            })
             # Gate execution (not the WS bookkeeping) so excess dispatched nodes
             # queue here instead of oversubscribing the card or the cores. A node
             # cancelled while queued raises CancelledError out of the acquire —
             # handled below like any other cancel.
             async with lane:
+                queue_wait_ms = (time.monotonic() - queued_at) * 1000.0
+                await self._safe_send(ws, {
+                    "type": WKR_NODE_STATUS,
+                    "call_id": call_id,
+                    "phase": "running",
+                    "node_type": node_type,
+                    "lane": lane_name,
+                    "queue_wait_ms": round(queue_wait_ms, 3),
+                })
+                _log(
+                    "info",
+                    f"running node {node_type}",
+                    call_id=call_id,
+                    lane=lane_name,
+                    queue_wait_ms=round(queue_wait_ms, 1),
+                )
                 output = await self.runner.run(msg, send_callback=send_callback)
             await self._send(ws, {
                 "type": WKR_NODE_DONE, "call_id": call_id,
@@ -451,9 +474,8 @@ if __name__ == "__main__":
     import asyncio as _asyncio
 
     async def _smoke() -> None:
-        # A finishing node must fail ONLY its own pending callbacks, never a
-        # concurrently-running node's — the flat sweep used to abort every
-        # node's callbacks (spurious failures + dropped results).
+        # A finishing node must fail only its own pending callbacks, never a
+        # concurrently running node's callbacks.
         client = WorkerClient(server="wss://x", token="t", worker_id="w")
 
         # Security: the token rides in the X-Worker-Token header, never the URL
@@ -462,8 +484,8 @@ if __name__ == "__main__":
         assert "token=" not in _url, f"token must not be in the WS URL: {_url}"
         assert "worker_id=w" in _url, _url
 
-        # Frames are plain JSON text — no XOR keystream. ``_send`` emits a JSON
-        # string; ``_decode`` round-trips both a text and a UTF-8 binary frame.
+        # ``_send`` emits a JSON string; ``_decode`` accepts both a text and a
+        # UTF-8 binary frame.
         class _FakeWS:
             def __init__(self):
                 self.sent = []
@@ -477,6 +499,32 @@ if __name__ == "__main__":
         assert json.loads(fake.sent[0]) == {"type": "hello", "worker_id": "w", "emoji": "你好"}
         assert client._decode(fake.sent[0])["emoji"] == "你好"
         assert client._decode(fake.sent[0].encode("utf-8"))["emoji"] == "你好"
+
+        # A node reports both admission to its lane and the actual semaphore
+        # wait before completion. The server uses the latter as the queue-lag
+        # metric; emitting it from the runner is the only way to include work
+        # waiting behind another task on the same host.
+        class _FakeRunner:
+            async def run(self, msg, send_callback=None):
+                del msg, send_callback
+                return {"text": "done"}
+
+        client.runner = _FakeRunner()  # type: ignore[assignment]
+        fake.sent.clear()
+        await client._run_node(
+            fake,
+            {
+                "call_id": "queue-smoke",
+                "node_type": "EditVideo",
+                "gpu": False,
+            },
+        )
+        frames = [json.loads(raw) for raw in fake.sent]
+        statuses = [frame for frame in frames if frame["type"] == WKR_NODE_STATUS]
+        assert [frame["phase"] for frame in statuses] == ["queued", "running"]
+        assert statuses[1]["lane"] == "cpu"
+        assert statuses[1]["queue_wait_ms"] >= 0
+        assert frames[-1]["type"] == WKR_NODE_DONE
 
         loop = _asyncio.get_running_loop()
         fa = loop.create_future()

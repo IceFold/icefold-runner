@@ -248,9 +248,9 @@ class NodeRunner:
         async with http.stream("GET", url, headers=headers) as resp:
             resp.raise_for_status()
             # Unique temp file per writer. A shared, deterministic ``<hash>.py.part``
-            # races whenever two runner processes share this cache dir (a second
-            # runner instance, or an old + new container briefly overlapping across
-            # a restart): both open the same ``.part``, the first ``os.replace``
+            # races whenever two runner processes share this cache dir, including
+            # briefly overlapping containers during a restart: both open the same
+            # ``.part``, the first ``os.replace``
             # moves it to ``<hash>.py``, and the second then hits ENOENT renaming a
             # part file that's already gone. ``mkstemp`` gives each writer its own
             # file; ``os.replace`` still publishes atomically, so the last writer

@@ -30,12 +30,9 @@ def new_runner_id() -> str:
     """A fresh id for THIS runner process.
 
     The server keys its registry on ``(user, runner_id)``, and a second
-    connection under a LIVE id evicts the first. The old default was the
-    hostname — so two runners on one machine (the obvious way to use a big box)
-    presented the same id and kicked each other off forever, each eviction
-    failing whatever node the loser had in flight. A per-process id makes them
-    peers; the machine they share rides along as ``host`` in the hello, which is
-    the label a human actually reads.
+    connection under a live id evicts the first. A per-process id lets multiple
+    runners on one machine remain peers; the shared machine name travels as
+    ``host`` in the hello for display.
 
     Fresh per process, deliberately NOT persisted: a runner that crashed and
     restarted must not reclaim the id of the phantom connection it is still
@@ -49,8 +46,7 @@ if __name__ == "__main__":
     lane = default_cpu_lane()
     assert 1 <= lane <= MAX_DEFAULT_CPU_LANE, lane
 
-    # The whole point: two processes on one machine must NOT collide. (The old
-    # hostname default gave them the same id, and they evicted each other.)
+    # Two processes on one machine must not collide.
     ids = {new_runner_id() for _ in range(1000)}
     assert len(ids) == 1000, "runner ids must be unique per process"
     assert all(i and i.isalnum() for i in ids)

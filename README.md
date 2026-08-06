@@ -15,11 +15,11 @@ never executes third-party code; it only renders it into bundles for a runner.
 ```
    your machine (private, behind NAT)              IceFold server (public)
  ┌──────────────────────────────────┐  reverse WSS  ┌───────────────────────────┐
- │ icefold-runner                    │ ───────────► │ /v1/ws/worker?token         │
+ │ icefold-runner                    │ ───────────► │ /v1/ws/worker?worker_id=…   │
  │  • dials out, token auth          │  node_exec ◄─│ routes node runs (per user) │
  │  • reconnect + keepalive          │  node_done ─►│                             │
  │  • bundle runner:                 │              │                             │
- │    GET /v1/bundles/<hash>         │   HTTP pull  │ /upload  /download          │
+ │    GET /v1/bundles/<hash>         │   HTTP pull  │ /files  /scratch            │
  │    import bundle + preflight deps │ ◄──────────► │ /v1/workers/output          │
  │    await __icefold_run__          │              │                             │
  └──────────────────────────────────┘   HTTP push  └───────────────────────────┘
@@ -27,13 +27,16 @@ never executes third-party code; it only renders it into bundles for a runner.
 
 - **Control plane** rides the reverse WebSocket (`node_exec` / `cancel` →
   `node_status` / `node_done` / `missing_dep`) as plain JSON text frames — TLS
-  (wss) is the confidentiality layer. Each `node_exec` frame only carries a
+  (wss) is the confidentiality layer. The runner token travels in the
+  `X-Worker-Token` request header; only the non-secret `worker_id` is in the
+  query string. Each `node_exec` frame only carries a
   `bundle_hash` and a single already-sliced variant — no source.
 - **Bulk media + bundles** ride plain HTTP: the runner GETs inputs from the
-  server's `/upload` & `/download` and node bundles from `/v1/bundles/<hash>`
+  server's `/files` and `/scratch` mounts and node bundles from `/v1/bundles/<hash>`
   (sha256-addressed, cached locally as `runner_work_dir/bundles/<hash>.py`,
   re-hashed on every download), runs the bundle, POSTs products back to
-  `/v1/workers/output` (which returns server-canonical paths).
+  `/v1/workers/output` (which returns server-canonical paths and accepts at
+  most 2 GiB per product).
 - **The runner ships no node implementations and never compiles user source.**
   The IceFold server renders every node (your custom ones *and* the platform's
   built-in ones) into a self-contained `.py` bundle, with `python_deps` /
@@ -41,7 +44,8 @@ never executes third-party code; it only renders it into bundles for a runner.
   pre-flights the deps (sending back a structured `missing_dep` reply with
   platform-aware install hints if anything is absent), and awaits
   `__icefold_run__(inputs, ctx_dict)`. So when the server adds or upgrades
-  nodes, **you never have to upgrade the runner.**
+  nodes, the runner does not need an upgrade. Runner protocol or agent changes
+  are released as a new runner version.
 - Variant planning / dimension & provider resolution all stay on the server;
   each job is a single already-sliced leaf call.
 
@@ -72,10 +76,14 @@ pip install -e .
 
 ## Run
 
-Generate a token in the IceFold app (**Nodes ▸ Connect a runner**), then:
+Generate a token in the IceFold app (**Settings → Runners**), then:
 
 ```bash
-icefold-runner --token <your-token>
+install -m 600 /dev/null ~/.icefold-runner-token
+read -rsp 'Runner token: ' ICEFOLD_TOKEN_INPUT
+printf '%s' "$ICEFOLD_TOKEN_INPUT" > ~/.icefold-runner-token
+unset ICEFOLD_TOKEN_INPUT
+icefold-runner --token-file ~/.icefold-runner-token
 ```
 
 That's it — the token (GitHub-CI style) encodes + signs your IceFold user id, so
@@ -85,7 +93,8 @@ Every flag also reads an env var:
 
 | flag | env | meaning |
 |---|---|---|
-| `--token` | `ICEFOLD_RUNNER_TOKEN` | runner token from the IceFold app |
+| `--token-file` | `ICEFOLD_RUNNER_TOKEN_FILE` | path to a mode-0600 runner token file |
+| — | `ICEFOLD_RUNNER_TOKEN` | runner token via environment (the insecure `--token` flag is rejected) |
 | `--runner-id` | `ICEFOLD_RUNNER_ID` | stable id (default: hostname) |
 | `--work-dir` | `ICEFOLD_RUNNER_DIR` | scratch for staged inputs + products |
 
@@ -119,5 +128,5 @@ itself, not by node code.
   executes it; it verifies the bundle's sha256 matches the requested hash, but
   the bundle itself is whatever the server you authenticated to sends. Only
   point a runner at a server you trust.
-- The runner only talks to the one server you point it at, authenticated by the
-  shared token; it pulls input files and pushes products over HTTP to that host.
+- The runner only talks to the one server you point it at, authenticated by its
+  runner token; it pulls input files and pushes products over HTTP to that host.

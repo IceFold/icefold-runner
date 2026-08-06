@@ -1,8 +1,8 @@
-"""CLI entrypoint:  icefold-runner --token <token>
+"""CLI entrypoint: ``icefold-runner`` (token from a protected file or env).
 
 Run IceFold nodes on this machine. The runner reverse-connects to IceFold and
 serves the account the token belongs to — the token (generated in the IceFold
-app, Nodes ▸ Connect a runner) encodes + signs your user id, so there's no
+app, Settings → Runners) encodes + signs your user id, so there's no
 server URL or user id to pass.
 
 Bootstrap order matters: we point ``ICEFOLD_PROJECT_ROOT`` at the runner's
@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
+import stat
 
 # Lane width + runner identity are runner policy, not CLI policy — the CLI only
 # surfaces them as overridable defaults. They live in their own module because it
@@ -47,16 +48,18 @@ def _parse_args(argv):
     p = argparse.ArgumentParser(
         prog="icefold-runner",
         description="Run IceFold nodes on this machine. "
-                    "Get a token from the IceFold app (Nodes ▸ Connect a runner).",
+                    "Get a token from the IceFold app (Settings → Runners).",
     )
-    p.add_argument("--token", default=os.environ.get("ICEFOLD_RUNNER_TOKEN", ""),
-                   help="Runner token from the IceFold app. env: ICEFOLD_RUNNER_TOKEN")
+    p.add_argument("--token", default="", help=argparse.SUPPRESS)
+    p.add_argument(
+        "--token-file",
+        default=os.environ.get("ICEFOLD_RUNNER_TOKEN_FILE", ""),
+        help="Path to a mode-0600 token file. env: ICEFOLD_RUNNER_TOKEN_FILE",
+    )
     p.add_argument("--runner-id", default=os.environ.get("ICEFOLD_RUNNER_ID", "") or new_runner_id(),
                    help="Id for this runner process (default: a fresh random id). "
                         "The server keys its registry on this, so two runners "
-                        "sharing one id EVICT each other in a loop — which is "
-                        "what the old hostname default did to a second runner on "
-                        "the same machine. Set it only if you want a stable name "
+                        "sharing one id evict each other. Set it only if you want a stable name "
                         "and know you run exactly one. env: ICEFOLD_RUNNER_ID")
     p.add_argument("--work-dir",
                    default=os.environ.get("ICEFOLD_RUNNER_DIR", "") or os.path.abspath("./icefold-runner-data"),
@@ -82,23 +85,42 @@ def _parse_args(argv):
                         "env: ICEFOLD_RUNNER_GPU_CONCURRENCY (default: 1)")
     args = p.parse_args(argv)
 
+    if args.token:
+        p.error("--token is disabled because command-line secrets appear in process listings; use --token-file")
+    args.token = os.environ.get("ICEFOLD_RUNNER_TOKEN", "").strip()
+
+    if args.token_file:
+        try:
+            file_stat = os.stat(args.token_file)
+            if os.name != "nt" and file_stat.st_mode & (stat.S_IRWXG | stat.S_IRWXO):
+                p.error("--token-file must not be accessible by group or other users")
+            if file_stat.st_size > 8192:
+                p.error("--token-file is unexpectedly large")
+            with open(args.token_file, encoding="utf-8") as token_fh:
+                args.token = token_fh.read(8193).strip()
+        except OSError as exc:
+            p.error(f"cannot read --token-file: {exc}")
     if not args.token:
-        p.error("missing required argument: --token "
-                "(generate one in the IceFold app: Nodes ▸ Connect a runner)")
+        p.error("missing runner token (use --token-file or ICEFOLD_RUNNER_TOKEN)")
     return args
 
 
 def main(argv=None) -> int:
+    # Products and staged customer inputs are private to the runner account,
+    # including when an administrator launches it from a permissive shell.
+    os.umask(0o077)
     args = _parse_args(argv)
 
     # Built-in server; ICEFOLD_RUNNER_SERVER overrides for self-host / dev.
     server = os.environ.get("ICEFOLD_RUNNER_SERVER", "").strip() or DEFAULT_SERVER
 
     work_dir = os.path.abspath(args.work_dir)
-    # ``scratch`` = where a node writes its products (icefold.config.TMP_BASE_DIR);
+    # ``scratch`` = where a node writes its products (icefold.config.SCRATCH_BASE_DIR);
     # ``staged`` = where fetched input files land before a run.
     os.makedirs(os.path.join(work_dir, "data", "scratch"), exist_ok=True)
     os.makedirs(os.path.join(work_dir, "data", "staged"), exist_ok=True)
+    if os.name != "nt":
+        os.chmod(work_dir, 0o700)
 
     # Must precede any icefold import so DATA_DIR resolves under work_dir.
     os.environ["ICEFOLD_PROJECT_ROOT"] = work_dir
