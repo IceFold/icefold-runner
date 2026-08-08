@@ -8,6 +8,7 @@ Reconnects with jittered exponential backoff; an auth rejection is fatal.
 from __future__ import annotations
 
 import asyncio
+from collections import OrderedDict
 import inspect
 import json
 import os
@@ -40,6 +41,7 @@ from icefold.wire import (
     SRV_NODE_CALLBACK_RESULT,
     SRV_NODE_EXEC,
     SRV_PING,
+    SRV_WORKER_READY,
     WKR_HELLO,
     WKR_NODE_DONE,
     WKR_NODE_STATUS,
@@ -55,6 +57,7 @@ from icefold import log_error, log_info, log_warning
 
 _BACKOFF_MIN = 1.0
 _BACKOFF_MAX = 30.0
+_COMPLETED_CALL_CACHE = 32
 
 
 def _keepalive_s() -> float:
@@ -125,6 +128,18 @@ class WorkerClient:
             self.http_base, token, _log, staged_retention_s=staged_retention_s,
         )
         self._tasks: Dict[str, asyncio.Task] = {}
+        # The socket is transport, not execution ownership. A recovery-capable
+        # server may replace it while node tasks keep running; sends wait for
+        # the negotiated successor connection instead of binding to the socket
+        # that happened to deliver ``node_exec``.
+        self._active_ws = None
+        self._connection_ready = asyncio.Event()
+        self._resume_supported: Optional[bool] = None
+        self._preserved_calls: set[str] = set()
+        # Terminal frames are replayable by call_id after reconnect. This also
+        # closes the narrow race where execution finished just as the old link
+        # died. Bounded because text outputs can be material.
+        self._completed: "OrderedDict[str, dict]" = OrderedDict()
         # TWO LANES. Dispatch is otherwise unbounded, so a fan-out would run all
         # its heavy subprocesses at once — but the right cap differs sharply by
         # what the node contends for:
@@ -151,7 +166,9 @@ class WorkerClient:
         # Keyed by req_id → (call_id, future). The call_id scoping lets a
         # finishing node fail ONLY its own pending callbacks, never a
         # concurrently-running node's (multiple node_exec run at once).
-        self._pending_callbacks: Dict[str, Tuple[str, "asyncio.Future[dict]"]] = {}
+        self._pending_callbacks: Dict[
+            str, Tuple[str, "asyncio.Future[dict]", dict]
+        ] = {}
         # Monotonic timestamp of the most recent successful connect, or None
         # while disconnected. Drives the healthy-drop backoff reset.
         self._connected_at: Optional[float] = None
@@ -246,6 +263,9 @@ class WorkerClient:
                 "capabilities": ["builtin"],
             })
             self._connected_at = time.monotonic()
+            self._active_ws = ws
+            self._resume_supported = None
+            self._connection_ready.clear()
             _log("info", "connected", worker_id=self.worker_id)
             keepalive = asyncio.create_task(self._keepalive(ws))
             try:
@@ -255,9 +275,18 @@ class WorkerClient:
                         await self._handle(ws, msg)
             finally:
                 keepalive.cancel()
-                for t in list(self._tasks.values()):
-                    t.cancel()
-                self._tasks.clear()
+                can_resume = self._resume_supported is True
+                if self._active_ws is ws:
+                    self._active_ws = None
+                    self._connection_ready.clear()
+                if can_resume:
+                    self._preserved_calls.update(self._tasks)
+                    _log(
+                        "info", "connection lost; preserving in-flight calls",
+                        calls=len(self._tasks),
+                    )
+                else:
+                    self._cancel_preserved_and_active()
 
     async def _keepalive(self, ws) -> None:
         try:
@@ -287,19 +316,51 @@ class WorkerClient:
 
     # ── dispatch ──
 
+    def _cancel_preserved_and_active(self) -> None:
+        for task in list(self._tasks.values()):
+            task.cancel()
+        self._tasks.clear()
+        self._preserved_calls.clear()
+
+    def _accept_legacy_server(self) -> None:
+        """Finish negotiation when a pre-recovery server sends the first frame."""
+        if self._resume_supported is not None:
+            return
+        self._resume_supported = False
+        # Tasks inherited from a recovery-capable connection must not leak work
+        # into a rolled-back server that cannot reattach their pending calls.
+        for call_id in list(self._preserved_calls):
+            task = self._tasks.get(call_id)
+            if task is not None:
+                task.cancel()
+        self._preserved_calls.clear()
+        self._connection_ready.set()
+
     async def _handle(self, ws, msg: dict) -> None:
         mtype = msg.get("type", "")
+        if mtype == SRV_WORKER_READY:
+            self._resume_supported = bool(msg.get("resume_inflight"))
+            self._connection_ready.set()
+            if self._resume_supported:
+                self._preserved_calls.clear()
+                self._replay_recovery_frames()
+            return
+
+        self._accept_legacy_server()
         if mtype == SRV_NODE_EXEC:
             call_id = msg.get("call_id", "")
             if not call_id:
                 return
-            # Dedup a redelivered call_id on the same connection: overwriting the
-            # entry would orphan the still-running first task (its finally would
-            # later pop the second task's slot, leaving it untracked/uncancelable).
-            if call_id in self._tasks:
-                _log("warn", f"duplicate node_exec call_id {call_id!r}; ignoring redelivery")
+            cached = self._completed.get(call_id)
+            if cached is not None:
+                asyncio.create_task(self._send_live(cached))
                 return
-            self._tasks[call_id] = asyncio.create_task(self._run_node(ws, msg))
+            # Dedup survives connection replacement: a redelivery attaches the
+            # server's new awaiter to the task already executing here.
+            if call_id in self._tasks:
+                _log("info", f"reattached node_exec call_id {call_id!r}")
+                return
+            self._tasks[call_id] = asyncio.create_task(self._run_node(msg))
         elif mtype == SRV_CANCEL:
             task = self._tasks.get(msg.get("call_id", ""))
             if task is not None:
@@ -312,24 +373,24 @@ class WorkerClient:
             req_id = msg.get("req_id", "")
             entry = self._pending_callbacks.pop(req_id, None)
             if entry is not None:
-                _cid, fut = entry
+                _cid, fut, _frame = entry
                 if not fut.done():
                     fut.set_result(msg)
         elif mtype == SRV_PING:
-            await self._send(ws, {"type": WKR_PONG})
+            await self._send_live({"type": WKR_PONG})
 
-    async def _run_node(self, ws, msg: dict) -> None:
+    async def _run_node(self, msg: dict) -> None:
         call_id = msg["call_id"]
         node_type = msg.get("node_type", "")
         try:
-            send_callback = self._make_send_callback(ws, call_id)
+            send_callback = self._make_send_callback(call_id)
             # Pick the lane. Missing key (pre-lane server) → GPU lane, i.e.
             # serialized: see __init__.
             gpu = bool(msg.get("gpu", True))
             lane = self._gpu_sem if gpu else self._sem
             lane_name = "gpu" if gpu else "cpu"
             queued_at = time.monotonic()
-            await self._safe_send(ws, {
+            await self._safe_send({
                 "type": WKR_NODE_STATUS,
                 "call_id": call_id,
                 "phase": "queued",
@@ -342,7 +403,7 @@ class WorkerClient:
             # handled below like any other cancel.
             async with lane:
                 queue_wait_ms = (time.monotonic() - queued_at) * 1000.0
-                await self._safe_send(ws, {
+                await self._safe_send({
                     "type": WKR_NODE_STATUS,
                     "call_id": call_id,
                     "phase": "running",
@@ -358,7 +419,7 @@ class WorkerClient:
                     queue_wait_ms=round(queue_wait_ms, 1),
                 )
                 output = await self.runner.run(msg, send_callback=send_callback)
-            await self._send(ws, {
+            await self._send_terminal({
                 "type": WKR_NODE_DONE, "call_id": call_id,
                 "output": output, "err": "", "killed": False,
             })
@@ -373,14 +434,14 @@ class WorkerClient:
                 f"binaries={list(dep.missing_binaries)} python={list(dep.missing_python)}",
                 call_id=call_id,
             )
-            await self._safe_send(ws, make_missing_dep(
+            await self._send_terminal(make_missing_dep(
                 call_id=call_id,
                 missing_binaries=dep.missing_binaries,
                 missing_python=dep.missing_python,
                 install_hint=dep.install_hint,
             ))
         except asyncio.TimeoutError:
-            await self._safe_send(ws, {
+            await self._send_terminal({
                 "type": WKR_NODE_DONE, "call_id": call_id,
                 "output": None, "err": "remote node timed out", "killed": True,
             })
@@ -398,7 +459,7 @@ class WorkerClient:
                 f"node failed {node_type}: {e!r}\n{traceback.format_exc()}",
                 call_id=call_id,
             )
-            await self._safe_send(ws, {
+            await self._send_terminal({
                 "type": WKR_NODE_DONE, "call_id": call_id,
                 "output": None, "err": str(e) or repr(e), "killed": False,
             })
@@ -414,7 +475,7 @@ class WorkerClient:
         cancelled mid-LLM-call) so its awaiter doesn't hang — without touching
         a concurrently-running node's callbacks, which a flat sweep would
         wrongly abort (spurious failure + dropped result on the other node)."""
-        for req_id, (cid, fut) in list(self._pending_callbacks.items()):
+        for req_id, (cid, fut, _frame) in list(self._pending_callbacks.items()):
             if cid != call_id:
                 continue
             if not fut.done():
@@ -426,7 +487,7 @@ class WorkerClient:
                 })
             self._pending_callbacks.pop(req_id, None)
 
-    def _make_send_callback(self, ws, call_id: str):
+    def _make_send_callback(self, call_id: str):
         """Return the bundle-host callback sender bound to one node_exec.
 
         Bundles only ever see this closure (never the raw WS). It allocates
@@ -440,11 +501,12 @@ class WorkerClient:
         async def _send(kind: str, payload: dict):
             req_id = uuid.uuid4().hex
             fut: "asyncio.Future[dict]" = loop.create_future()
-            self._pending_callbacks[req_id] = (call_id, fut)
+            frame = make_node_callback(
+                call_id=call_id, req_id=req_id, kind=kind, payload=payload,
+            )
+            self._pending_callbacks[req_id] = (call_id, fut, frame)
             try:
-                await self._send(ws, make_node_callback(
-                    call_id=call_id, req_id=req_id, kind=kind, payload=payload,
-                ))
+                await self._send_live(frame)
             except Exception:
                 self._pending_callbacks.pop(req_id, None)
                 raise
@@ -455,9 +517,42 @@ class WorkerClient:
 
         return _send
 
-    async def _safe_send(self, ws, msg: dict) -> None:
+    async def _send_live(self, msg: dict) -> None:
+        """Send on the negotiated live connection, surviving socket turnover."""
+        while True:
+            await self._connection_ready.wait()
+            ws = self._active_ws
+            if ws is None:
+                self._connection_ready.clear()
+                continue
+            try:
+                await self._send(ws, msg)
+                return
+            except Exception:  # noqa: BLE001
+                if self._active_ws is ws:
+                    self._connection_ready.clear()
+                await asyncio.sleep(0)
+
+    async def _send_terminal(self, msg: dict) -> None:
+        call_id = str(msg.get("call_id") or "")
+        if call_id:
+            self._completed[call_id] = dict(msg)
+            self._completed.move_to_end(call_id)
+            while len(self._completed) > _COMPLETED_CALL_CACHE:
+                self._completed.popitem(last=False)
+        await self._send_live(msg)
+
+    def _replay_recovery_frames(self) -> None:
+        # Callback req_ids are deduplicated by the recovery-capable server, so
+        # replay is safe even if the old reply was the packet that got lost.
+        for _call_id, _future, frame in self._pending_callbacks.values():
+            asyncio.create_task(self._send_live(frame))
+        for frame in self._completed.values():
+            asyncio.create_task(self._send_live(frame))
+
+    async def _safe_send(self, msg: dict) -> None:
         try:
-            await self._send(ws, msg)
+            await self._send_live(msg)
         except Exception:  # noqa: BLE001
             pass
 
@@ -511,8 +606,10 @@ if __name__ == "__main__":
 
         client.runner = _FakeRunner()  # type: ignore[assignment]
         fake.sent.clear()
+        client._active_ws = fake
+        client._resume_supported = True
+        client._connection_ready.set()
         await client._run_node(
-            fake,
             {
                 "call_id": "queue-smoke",
                 "node_type": "EditVideo",
@@ -526,17 +623,81 @@ if __name__ == "__main__":
         assert statuses[1]["queue_wait_ms"] >= 0
         assert frames[-1]["type"] == WKR_NODE_DONE
 
+        # Recovery-capable transport replacement keeps the SAME task alive and
+        # delivers its terminal frame through the successor socket. A duplicate
+        # call_id then replays the cached result instead of executing twice.
+        release = _asyncio.Event()
+
+        class _SlowRunner:
+            calls = 0
+
+            async def run(self, msg, send_callback=None):
+                del msg, send_callback
+                self.calls += 1
+                await release.wait()
+                return {"text": "survived"}
+
+        recovering = WorkerClient(server="wss://x", token="t", worker_id="recover")
+        slow = _SlowRunner()
+        recovering.runner = slow  # type: ignore[assignment]
+        first_ws = _FakeWS()
+        recovering._active_ws = first_ws
+        recovering._resume_supported = True
+        recovering._connection_ready.set()
+        recover_msg = {
+            "call_id": "recover-call", "node_type": "ExtractFrame", "gpu": False,
+        }
+        recover_task = _asyncio.create_task(recovering._run_node(recover_msg))
+        recovering._tasks["recover-call"] = recover_task
+        for _ in range(50):
+            await _asyncio.sleep(0)
+            if first_ws.sent:
+                break
+        recovering._active_ws = None
+        recovering._connection_ready.clear()
+        recovering._preserved_calls.add("recover-call")
+        second_ws = _FakeWS()
+        recovering._active_ws = second_ws
+        await recovering._handle(
+            second_ws, {"type": SRV_WORKER_READY, "resume_inflight": True},
+        )
+        release.set()
+        await recover_task
+        assert slow.calls == 1
+        assert any(
+            json.loads(raw).get("type") == WKR_NODE_DONE for raw in second_ws.sent
+        )
+        before = len(second_ws.sent)
+        await recovering._handle(second_ws, {"type": SRV_NODE_EXEC, **recover_msg})
+        for _ in range(50):
+            await _asyncio.sleep(0)
+            if len(second_ws.sent) > before:
+                break
+        assert slow.calls == 1, "cached call_id must not execute twice"
+
         loop = _asyncio.get_running_loop()
+        callback_future = loop.create_future()
+        client._pending_callbacks["reply"] = (
+            "C", callback_future, {"req_id": "reply"},
+        )
+        await client._handle(fake, {
+            "type": SRV_NODE_CALLBACK_RESULT, "call_id": "C", "req_id": "reply",
+            "ok": True, "result": "callback-ok", "error": "",
+        })
+        assert callback_future.result()["result"] == "callback-ok"
+
         fa = loop.create_future()
         fb = loop.create_future()
-        client._pending_callbacks["ra"] = ("A", fa)
-        client._pending_callbacks["rb"] = ("B", fb)
+        client._pending_callbacks["ra"] = ("A", fa, {"req_id": "ra"})
+        client._pending_callbacks["rb"] = ("B", fb, {"req_id": "rb"})
 
         client._fail_pending_callbacks("A")
         assert fa.done() and fa.result()["ok"] is False, "A's callback must fail"
         assert "ra" not in client._pending_callbacks, "A's callback must drop"
         assert not fb.done(), "B's in-flight callback must NOT be touched"
-        assert client._pending_callbacks.get("rb") == ("B", fb), "B's callback must remain"
+        assert client._pending_callbacks.get("rb") == (
+            "B", fb, {"req_id": "rb"}
+        ), "B's callback must remain"
 
         client._fail_pending_callbacks("B")
         assert fb.done() and "rb" not in client._pending_callbacks

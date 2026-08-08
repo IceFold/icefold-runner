@@ -48,6 +48,13 @@ never executes third-party code; it only renders it into bundles for a runner.
   are released as a new runner version.
 - Variant planning / dimension & provider resolution all stay on the server;
   each job is a single already-sliced leaf call.
+- **Transient WebSocket loss does not restart a node.** Recovery-capable server
+  and runner versions negotiate this in `worker_ready`: the runner keeps the
+  task alive, the server reattaches its pending `call_id`, and terminal frames
+  plus host callbacks replay by id. If the runner process itself is lost, the
+  server automatically resubmits the same `call_id` to a replacement runner.
+  Older peers do not advertise recovery, so rolling upgrades retain the legacy
+  cancel-on-disconnect behaviour instead of guessing across protocol versions.
 
 ## Install
 
@@ -95,7 +102,7 @@ Every flag also reads an env var:
 |---|---|---|
 | `--token-file` | `ICEFOLD_RUNNER_TOKEN_FILE` | path to a mode-0600 runner token file |
 | — | `ICEFOLD_RUNNER_TOKEN` | runner token via environment (the insecure `--token` flag is rejected) |
-| `--runner-id` | `ICEFOLD_RUNNER_ID` | stable id (default: hostname) |
+| `--runner-id` | `ICEFOLD_RUNNER_ID` | stable id override (default: fresh process id) |
 | `--work-dir` | `ICEFOLD_RUNNER_DIR` | scratch for staged inputs + products |
 
 The runner honors standard proxy env vars (`HTTPS_PROXY`, …) for reaching the
