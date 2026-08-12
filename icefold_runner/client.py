@@ -106,6 +106,14 @@ def _server_close_code(e: Exception) -> Optional[int]:
     return getattr(getattr(e, "rcvd", None), "code", None)
 
 
+def _gpu_job(msg: dict) -> bool:
+    """Read the required execution lane from a node-exec frame."""
+    value = msg.get("gpu")
+    if not isinstance(value, bool):
+        raise RuntimeError("node_exec requires a boolean gpu lane")
+    return value
+
+
 class WorkerClient:
     def __init__(
         self,
@@ -144,18 +152,15 @@ class WorkerClient:
         # its heavy subprocesses at once — but the right cap differs sharply by
         # what the node contends for:
         #
-        #   cpu lane — ffmpeg muxing/transcode, movis, PIL. Scales with cores;
+        #   cpu lane — browser rendering, ffmpeg muxing/transcode, PIL. Scales with cores;
         #     running several is a genuine speedup.
-        #   gpu lane — anything that loads a model into VRAM (``stable-ts``, so
-        #     ComposeVideo). Oversubscribing THRASHES: N whisper models fighting
+        #   gpu lane — anything that loads a model into VRAM (``stable-ts`` in
+        #     TimeSubtitles). Oversubscribing THRASHES: N whisper models fighting
         #     over one card is far slower than running them one after another.
         #     Serialized by default, and that default is load-bearing.
         #
-        # The server tags each node_exec with ``gpu``. A frame that carries no
-        # such key came from a pre-lane server, which assumed a single serialized
-        # semaphore — so it goes in the GPU lane and everything serializes,
-        # exactly as that server expects. Fail-safe, not fail-fast: the cost is
-        # lost parallelism for one deploy window, not a melted GPU.
+        # The server tags every node_exec with an explicit boolean ``gpu``.
+        # Lane ownership is protocol state, never inferred by the runner.
         self._sem = asyncio.Semaphore(max(1, concurrency))
         self._gpu_sem = asyncio.Semaphore(max(1, gpu_concurrency))
         # Bundle-host callback bookkeeping: bundle code reaches back into the
@@ -384,9 +389,7 @@ class WorkerClient:
         node_type = msg.get("node_type", "")
         try:
             send_callback = self._make_send_callback(call_id)
-            # Pick the lane. Missing key (pre-lane server) → GPU lane, i.e.
-            # serialized: see __init__.
-            gpu = bool(msg.get("gpu", True))
+            gpu = _gpu_job(msg)
             lane = self._gpu_sem if gpu else self._sem
             lane_name = "gpu" if gpu else "cpu"
             queued_at = time.monotonic()
@@ -715,7 +718,7 @@ if __name__ == "__main__":
 
         # ── Lanes ──
         # The two semaphores are separate objects with separate widths: a GPU
-        # node must never be able to consume CPU-lane capacity, or a ComposeVideo
+        # node must never be able to consume CPU-lane capacity, or a TimeSubtitles
         # fan-out would put N whisper models on the card at once.
         lanes = WorkerClient(
             server="wss://x", token="t", worker_id="w",
@@ -726,15 +729,16 @@ if __name__ == "__main__":
 
         def _lane_for(msg: dict):
             """The lane pick, exactly as _run_node computes it."""
-            return lanes._gpu_sem if bool(msg.get("gpu", True)) else lanes._sem
+            return lanes._gpu_sem if _gpu_job(msg) else lanes._sem
 
-        assert _lane_for({"gpu": True}) is lanes._gpu_sem      # ComposeVideo
+        assert _lane_for({"gpu": True}) is lanes._gpu_sem      # TimeSubtitles
         assert _lane_for({"gpu": False}) is lanes._sem         # EditVideo & co
-        # NO key at all = a server that predates lanes, which assumed ONE
-        # serialized semaphore. Fail SAFE: serialize. Reading a missing key as
-        # False would put every node — whisper included — in the parallel lane
-        # and melt the card for one deploy window.
-        assert _lane_for({}) is lanes._gpu_sem
+        try:
+            _lane_for({})
+        except RuntimeError as exc:
+            assert "boolean gpu lane" in str(exc)
+        else:
+            raise AssertionError("lane-less node_exec must be rejected")
 
         # Both lanes floor at 1: a 0 or negative override must not deadlock the
         # runner into accepting nodes it can never start.

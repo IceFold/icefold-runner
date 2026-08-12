@@ -29,8 +29,9 @@ never executes third-party code; it only renders it into bundles for a runner.
   `node_status` / `node_done` / `missing_dep`) as plain JSON text frames — TLS
   (wss) is the confidentiality layer. The runner token travels in the
   `X-Worker-Token` request header; only the non-secret `worker_id` is in the
-  query string. Each `node_exec` frame only carries a
-  `bundle_hash` and a single already-sliced variant — no source.
+  query string. Each `node_exec` frame carries a `bundle_hash`, the selected
+  variant's inputs, and the confirmed variant input storage needed by the
+  bundle's typed runtime — never node source.
 - **Bulk media + bundles** ride plain HTTP: the runner GETs inputs from the
   server's `/files` and `/scratch` mounts and node bundles from `/v1/bundles/<hash>`
   (sha256-addressed, cached locally as `runner_work_dir/bundles/<hash>.py`,
@@ -61,8 +62,9 @@ never executes third-party code; it only renders it into bundles for a runner.
 Requires only **Python ≥ 3.11** (it pulls in `icefold-sdk`).
 
 The runner itself ships no node tooling. A node declares what it needs in its
-bundle header — `binary_deps` (e.g. `ffmpeg` / `ffprobe` on `PATH` for media
-nodes) and `python_deps` (whatever your custom nodes import) — and the runner
+bundle header — `binary_deps` (for example, IceFold video nodes use
+`google-chrome`, `ffmpeg`, and `ffprobe` on `PATH`) and `python_deps` (whatever
+your custom nodes import) — and the runner
 **pre-flights those before each run**, replying with a platform-aware install
 hint (`missing_dep`) for anything absent. So you install a node's dependencies
 only when you actually run a job that needs them, and the runner tells you

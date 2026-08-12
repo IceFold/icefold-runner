@@ -14,8 +14,8 @@ Per call:
   3. pre-flight the declared deps (``shutil.which`` + ``import_module``);
      surface ``MissingDependencyError`` so the client wraps a structured
      ``missing_dep`` reply instead of ``node_done``
-  4. download ``/files/`` & ``/scratch/`` input refs to a staging dir and
-     rewrite them to local paths
+  4. download ``/files/`` & ``/scratch/`` refs from both the current inputs and
+     their complete variant storage to one staging dir and rewrite local paths
   5. await ``__icefold_run__(local_inputs, ctx_dict)``
   6. upload product files back to the server and rewrite the output to the
      server-canonical paths it hands back
@@ -34,7 +34,7 @@ import sys
 import tempfile
 import time
 from types import ModuleType
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
@@ -138,12 +138,14 @@ class NodeRunner:
         # from any caller of this public framework falls back to the default
         # instead of raising ``TypeError`` on ``None / 1000``.
         timeout = max(1.0, (msg.get("timeout_ms") or 1800_000) / 1000.0)
+        if not isinstance(msg.get("raw_inputs"), dict):
+            raise RuntimeError("node_exec requires raw_inputs")
 
         # Per-call staging dir for downloaded inputs. NOT removed at end-of-run:
         # a per-run ``rmtree`` could pull a staged file out from under a
         # subprocess that outlived the awaiting task (a cancelled/timed-out
         # ffmpeg or stable-ts keeps running in its thread), which stranded
-        # concurrent ComposeVideo variants with "No such file". Reap by age
+        # concurrent node variants with "No such file". Reap by age
         # instead — swept here before staging, so a fresh dir (mtime≈now) is
         # never caught mid-run, while old dirs from finished runs still get
         # collected before the disk fills (ENOSPC). Off the event loop: the
@@ -153,9 +155,16 @@ class NodeRunner:
         stage_dir = os.path.join(_STAGED_DIR, os.urandom(8).hex())
         os.makedirs(stage_dir, exist_ok=True)
         async with httpx.AsyncClient(timeout=httpx.Timeout(600.0)) as http:
-            local_inputs = await self._download_inputs(http, msg.get("inputs") or {}, stage_dir)
+            staged = await self._download_inputs(http, {
+                "inputs": msg.get("inputs") or {},
+                "raw_inputs": msg["raw_inputs"],
+            }, stage_dir)
+            local_inputs = staged["inputs"]
+            local_raw_inputs = staged["raw_inputs"]
             output = await asyncio.wait_for(
-                self._run_bundle(http, bundle_hash, msg, local_inputs, send_callback),
+                self._run_bundle(
+                    http, bundle_hash, msg, local_inputs, local_raw_inputs, send_callback,
+                ),
                 timeout=timeout,
             )
             return await self._upload_outputs(http, output, msg.get("session_id", ""))
@@ -168,6 +177,7 @@ class NodeRunner:
         bundle_hash: str,
         msg: dict,
         local_inputs: Any,
+        local_raw_inputs: Dict[str, Any],
         send_callback,
     ) -> Any:
         """Fetch + pre-flight + exec a server-rendered self-contained bundle."""
@@ -194,7 +204,7 @@ class NodeRunner:
             # bundle's NodeContext can answer variant_has_tag / resolve_by_tag
             # the same as an in-process run.
             "dims": msg.get("dims") or [],
-            "raw_inputs": local_inputs if isinstance(local_inputs, dict) else {},
+            "raw_inputs": local_raw_inputs,
             "provider": msg.get("provider") or {},
             "model": msg.get("model", ""),
         }
@@ -327,15 +337,31 @@ class NodeRunner:
 
     # ── input staging (download) ──
 
-    async def _download_inputs(self, http: httpx.AsyncClient, inputs: Any, stage_dir: str) -> Any:
+    async def _download_inputs(
+        self,
+        http: httpx.AsyncClient,
+        inputs: Any,
+        stage_dir: str,
+        downloaded: Optional[Dict[str, str]] = None,
+    ) -> Any:
+        if downloaded is None:
+            downloaded = {}
         if isinstance(inputs, str):
             if _is_server_ref(inputs):
-                return await self._download_one(http, inputs, stage_dir)
+                if inputs not in downloaded:
+                    downloaded[inputs] = await self._download_one(http, inputs, stage_dir)
+                return downloaded[inputs]
             return inputs
         if isinstance(inputs, dict):
-            return {k: await self._download_inputs(http, v, stage_dir) for k, v in inputs.items()}
+            return {
+                k: await self._download_inputs(http, v, stage_dir, downloaded)
+                for k, v in inputs.items()
+            }
         if isinstance(inputs, (list, tuple)):
-            return [await self._download_inputs(http, v, stage_dir) for v in inputs]
+            return [
+                await self._download_inputs(http, v, stage_dir, downloaded)
+                for v in inputs
+            ]
         return inputs
 
     async def _download_one(self, http: httpx.AsyncClient, ref: str, stage_dir: str) -> str:
@@ -397,6 +423,23 @@ if __name__ == "__main__":
         runner = NodeRunner("http://x", "tok", lambda *a, **k: None, staged_retention_s=3600)
         captured: dict = {}
 
+        # Current + raw inputs often name the same media. They share one staged
+        # copy while retaining both structures for the bundle ABI.
+        download_calls: list[str] = []
+
+        async def _fake_download_one(http, ref, stage_dir):
+            download_calls.append(ref)
+            return os.path.join(stage_dir, "shared.bin")
+
+        runner._download_one = _fake_download_one  # type: ignore[assignment]
+        async with httpx.AsyncClient() as fake_http:
+            staged = await runner._download_inputs(fake_http, {
+                "inputs": {"a": "/files/x"},
+                "raw_inputs": {"a": {"lang=en": "/files/x"}},
+            }, tempfile.mkdtemp())
+        assert download_calls == ["/files/x"]
+        assert staged["inputs"]["a"] == staged["raw_inputs"]["a"]["lang=en"]
+
         async def _fake_download(http, inputs, stage_dir):
             captured["stage_dir"] = stage_dir
             assert os.path.isdir(stage_dir)
@@ -404,8 +447,12 @@ if __name__ == "__main__":
                 fh.write(b"x")
             return inputs
 
-        async def _fake_run_bundle(http, bundle_hash, msg, local_inputs, send_callback):
+        async def _fake_run_bundle(
+            http, bundle_hash, msg, local_inputs, local_raw_inputs, send_callback,
+        ):
             assert os.path.isdir(captured["stage_dir"]), "stage dir must live during run"
+            assert local_inputs == {"a": "/files/x"}
+            assert local_raw_inputs == {"a": {"lang=en": "/files/x"}}
             return "out"
 
         async def _fake_upload(http, output, session_id):
@@ -415,7 +462,11 @@ if __name__ == "__main__":
         runner._run_bundle = _fake_run_bundle      # type: ignore[assignment]
         runner._upload_outputs = _fake_upload      # type: ignore[assignment]
 
-        out = await runner.run({"bundle_hash": "abc", "inputs": {"a": "/files/x"}})
+        out = await runner.run({
+            "bundle_hash": "abc",
+            "inputs": {"a": "/files/x"},
+            "raw_inputs": {"a": {"lang=en": "/files/x"}},
+        })
         assert out == "out"
         # NOT removed at end-of-run — the fresh dir (mtime≈now) survives.
         assert os.path.isdir(captured["stage_dir"]), "fresh stage dir must survive its run"
@@ -425,18 +476,24 @@ if __name__ == "__main__":
         stale = os.path.join(_STAGED_DIR, "stale")
         os.makedirs(stale, exist_ok=True)
         os.utime(stale, (time.time() - 7200, time.time() - 7200))  # 2h old, window 1h
-        out2 = await runner.run({"bundle_hash": "abc", "inputs": {}})
+        out2 = await runner.run({
+            "bundle_hash": "abc",
+            "inputs": {"a": "/files/x"},
+            "raw_inputs": {"a": {"lang=en": "/files/x"}},
+        })
         assert out2 == "out"
         assert not os.path.isdir(stale), "stale stage dir must be reaped by age"
         assert os.path.isdir(captured["stage_dir"]), "the just-run dir must survive the sweep"
 
         # A bundle error still propagates (no swallowing).
-        async def _boom(http, bundle_hash, msg, local_inputs, send_callback):
+        async def _boom(
+            http, bundle_hash, msg, local_inputs, local_raw_inputs, send_callback,
+        ):
             raise RuntimeError("boom")
 
         runner._run_bundle = _boom  # type: ignore[assignment]
         try:
-            await runner.run({"bundle_hash": "abc", "inputs": {}})
+            await runner.run({"bundle_hash": "abc", "inputs": {}, "raw_inputs": {}})
         except RuntimeError:
             pass
         else:

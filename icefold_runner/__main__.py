@@ -71,14 +71,14 @@ def _parse_args(argv):
                         f"env: ICEFOLD_RUNNER_STAGED_ROTATION (default: {_DEFAULT_ROTATION})")
     p.add_argument("--concurrency", type=int,
                    default=int(os.environ.get("ICEFOLD_RUNNER_CONCURRENCY", "") or default_cpu_lane()),
-                   help="Max CPU-lane nodes at once (ffmpeg, movis, PIL); excess "
+                   help="Max CPU-lane nodes at once (Chrome, ffmpeg, PIL); excess "
                         "queue. Scales with cores. GPU work is NOT in this lane — "
                         "see --gpu-concurrency. "
                         f"env: ICEFOLD_RUNNER_CONCURRENCY (default: {default_cpu_lane()} here)")
     p.add_argument("--gpu-concurrency", type=int,
                    default=int(os.environ.get("ICEFOLD_RUNNER_GPU_CONCURRENCY", "") or 1),
                    help="Max GPU-lane nodes at once — anything that loads a model "
-                        "into VRAM (stable-ts, so ComposeVideo). 1 is the right "
+                        "into VRAM (stable-ts in TimeSubtitles). 1 is the right "
                         "answer on one card: two whisper models fighting over it "
                         "are far SLOWER than running them back to back. Raise only "
                         "if you have the VRAM to prove otherwise. "
