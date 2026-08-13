@@ -97,8 +97,8 @@ class NodeRunner:
 
         Reaping by age — rather than an end-of-run ``rmtree`` — keeps a run from
         ever deleting a staged file that another run, or a subprocess that
-        outlived its awaiting task (a cancelled/timed-out ffmpeg or stable-ts
-        keeps running in its worker thread), is still reading. Safe as long as
+        outlived its awaiting task (for example, a cancelled or timed-out
+        subprocess that keeps running in its worker thread), is still reading. Safe as long as
         the window exceeds the node timeout, so an in-flight dir (mtime≈now) is
         never swept out from under its own run.
         """
@@ -143,8 +143,8 @@ class NodeRunner:
 
         # Per-call staging dir for downloaded inputs. NOT removed at end-of-run:
         # a per-run ``rmtree`` could pull a staged file out from under a
-        # subprocess that outlived the awaiting task (a cancelled/timed-out
-        # ffmpeg or stable-ts keeps running in its thread), which stranded
+        # subprocess that outlived the awaiting task (a cancelled or timed-out
+        # media command keeps running in its thread), which stranded
         # concurrent node variants with "No such file". Reap by age
         # instead — swept here before staging, so a fresh dir (mtime≈now) is
         # never caught mid-run, while old dirs from finished runs still get

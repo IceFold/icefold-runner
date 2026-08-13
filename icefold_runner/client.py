@@ -154,9 +154,8 @@ class WorkerClient:
         #
         #   cpu lane — browser rendering, ffmpeg muxing/transcode, PIL. Scales with cores;
         #     running several is a genuine speedup.
-        #   gpu lane — anything that loads a model into VRAM (``stable-ts`` in
-        #     AlignSubtitles). Oversubscribing THRASHES: N whisper models fighting
-        #     over one card is far slower than running them one after another.
+        #   gpu lane — anything that loads a model into VRAM. Oversubscribing can
+        #     exhaust memory or make several models slower than serial execution.
         #     Serialized by default, and that default is load-bearing.
         #
         # The server tags every node_exec with an explicit boolean ``gpu``.
@@ -718,8 +717,8 @@ if __name__ == "__main__":
 
         # ── Lanes ──
         # The two semaphores are separate objects with separate widths: a GPU
-        # node must never be able to consume CPU-lane capacity, or an AlignSubtitles
-        # fan-out would put N whisper models on the card at once.
+        # node must never be able to consume CPU-lane capacity, or a GPU fan-out
+        # could put too many models on one card at once.
         lanes = WorkerClient(
             server="wss://x", token="t", worker_id="w",
             concurrency=8, gpu_concurrency=1,
@@ -731,8 +730,8 @@ if __name__ == "__main__":
             """The lane pick, exactly as _run_node computes it."""
             return lanes._gpu_sem if _gpu_job(msg) else lanes._sem
 
-        assert _lane_for({"gpu": True}) is lanes._gpu_sem      # AlignSubtitles
-        assert _lane_for({"gpu": False}) is lanes._sem         # EditVideo & co
+        assert _lane_for({"gpu": True}) is lanes._gpu_sem
+        assert _lane_for({"gpu": False}) is lanes._sem
         try:
             _lane_for({})
         except RuntimeError as exc:
