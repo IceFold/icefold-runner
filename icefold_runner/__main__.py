@@ -78,7 +78,7 @@ def _parse_args(argv):
     p.add_argument("--gpu-concurrency", type=int,
                    default=int(os.environ.get("ICEFOLD_RUNNER_GPU_CONCURRENCY", "") or 1),
                    help="Max GPU-lane nodes at once — anything that loads a model "
-                        "into VRAM (stable-ts in TimeSubtitles). 1 is the right "
+                        "into VRAM (stable-ts in AlignSubtitles). 1 is the right "
                         "answer on one card: two whisper models fighting over it "
                         "are far SLOWER than running them back to back. Raise only "
                         "if you have the VRAM to prove otherwise. "
