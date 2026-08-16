@@ -106,9 +106,16 @@ Every flag also reads an env var:
 | — | `ICEFOLD_RUNNER_TOKEN` | runner token via environment (the insecure `--token` flag is rejected) |
 | `--runner-id` | `ICEFOLD_RUNNER_ID` | stable id override (default: fresh process id) |
 | `--work-dir` | `ICEFOLD_RUNNER_DIR` | scratch for staged inputs + products |
+| `--concurrency` | `ICEFOLD_RUNNER_CONCURRENCY` | CPU-lane slots for ffmpeg/Pillow work (default: detected CPUs, capped at 8) |
+| `--gpu-concurrency` | `ICEFOLD_RUNNER_GPU_CONCURRENCY` | GPU-lane slots (default: 1) |
 
 The runner honors standard proxy env vars (`HTTPS_PROXY`, …) for reaching the
 server. It reconnects automatically with backoff; an auth rejection is fatal.
+
+The runner advertises both effective lane widths in its WebSocket `hello` frame.
+Servers that understand these fields can fill a high-capacity runner before
+using a smaller backup; older servers safely ignore the extra fields. A newer
+server treats an older runner that does not advertise capacity as one slot.
 
 > Self-hosting / dev: point the runner at a different server with the
 > `ICEFOLD_RUNNER_SERVER` env var (e.g. `ws://127.0.0.1:7000`).

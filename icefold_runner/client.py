@@ -128,6 +128,8 @@ class WorkerClient:
     ) -> None:
         if concurrency is None:
             concurrency = default_cpu_lane()
+        self.cpu_concurrency = max(1, concurrency)
+        self.gpu_concurrency = max(1, gpu_concurrency)
         self.server = server
         self.token = token
         self.worker_id = worker_id
@@ -160,8 +162,8 @@ class WorkerClient:
         #
         # The server tags every node_exec with an explicit boolean ``gpu``.
         # Lane ownership is protocol state, never inferred by the runner.
-        self._sem = asyncio.Semaphore(max(1, concurrency))
-        self._gpu_sem = asyncio.Semaphore(max(1, gpu_concurrency))
+        self._sem = asyncio.Semaphore(self.cpu_concurrency)
+        self._gpu_sem = asyncio.Semaphore(self.gpu_concurrency)
         # Bundle-host callback bookkeeping: bundle code reaches back into the
         # server via ``ctx.progress(...)`` / ``ctx.llm.text(...)``; those land
         # here as outbound ``node_callback`` frames keyed by ``req_id`` and
@@ -197,6 +199,26 @@ class WorkerClient:
         # from the token so this runner can't claim another account.
         query = urlencode({"worker_id": self.worker_id})
         return urlunsplit((scheme, parts.netloc, path, query, ""))
+
+    def _hello_frame(self) -> dict:
+        """Describe this process and the capacity of each execution lane."""
+        return {
+            "type": WKR_HELLO,
+            "worker_id": self.worker_id,
+            "version": VERSION,
+            # Shown in Settings → Runners ("Linux" / "Darwin" / "Windows").
+            "os": platform.system(),
+            # The machine this runner is on. Since ``worker_id`` became a
+            # per-process id, THIS is the human-recognisable label — and two
+            # runners on one box now show the same host, which is the point.
+            "host": socket.gethostname(),
+            "capabilities": ["builtin"],
+            # Extra hello fields are ignored by older backends. A new backend
+            # treats an older runner that omits them as a conservative one-slot
+            # worker until it upgrades and reports its real lane widths.
+            "cpu_concurrency": self.cpu_concurrency,
+            "gpu_concurrency": self.gpu_concurrency,
+        }
 
     # ── main loop ──
 
@@ -254,18 +276,7 @@ class WorkerClient:
                 raise AuthError(str(e))
             raise
         async with ws:
-            await self._send(ws, {
-                "type": WKR_HELLO,
-                "worker_id": self.worker_id,
-                "version": VERSION,
-                # Shown in Settings → Runners ("Linux" / "Darwin" / "Windows").
-                "os": platform.system(),
-                # The machine this runner is on. Since ``worker_id`` became a
-                # per-process id, THIS is the human-recognisable label — and two
-                # runners on one box now show the same host, which is the point.
-                "host": socket.gethostname(),
-                "capabilities": ["builtin"],
-            })
+            await self._send(ws, self._hello_frame())
             self._connected_at = time.monotonic()
             self._active_ws = ws
             self._resume_supported = None
@@ -723,6 +734,9 @@ if __name__ == "__main__":
             server="wss://x", token="t", worker_id="w",
             concurrency=8, gpu_concurrency=1,
         )
+        hello = lanes._hello_frame()
+        assert hello["cpu_concurrency"] == 8
+        assert hello["gpu_concurrency"] == 1
         assert lanes._sem is not lanes._gpu_sem
         assert lanes._sem._value == 8 and lanes._gpu_sem._value == 1
 
@@ -745,6 +759,7 @@ if __name__ == "__main__":
             server="wss://x", token="t", worker_id="w",
             concurrency=0, gpu_concurrency=-3,
         )
+        assert floored.cpu_concurrency == 1 and floored.gpu_concurrency == 1
         assert floored._sem._value == 1 and floored._gpu_sem._value == 1
 
         print("icefold_runner.client: OK")
