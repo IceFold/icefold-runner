@@ -109,8 +109,9 @@ Every flag also reads an env var:
 | `--concurrency` | `ICEFOLD_RUNNER_CONCURRENCY` | CPU-lane slots for ffmpeg/Pillow work (default: detected CPUs, capped at 8) |
 | `--gpu-concurrency` | `ICEFOLD_RUNNER_GPU_CONCURRENCY` | GPU-lane slots (default: 1) |
 
-The runner honors standard proxy env vars (`HTTPS_PROXY`, …) for reaching the
-server. It reconnects automatically with backoff; an auth rejection is fatal.
+The runner honors standard proxy env vars (`HTTPS_PROXY`, `ALL_PROXY`, …) for
+reaching the server, including HTTP and SOCKS proxies. It reconnects
+automatically with backoff; an auth rejection is fatal.
 
 The runner advertises both effective lane widths in its WebSocket `hello` frame.
 Servers that understand these fields can fill a high-capacity runner before
